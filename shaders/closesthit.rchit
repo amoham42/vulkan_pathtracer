@@ -74,9 +74,9 @@ void main() {
 
     const Face face = unpackFace(gl_PrimitiveID);
     payload.brdf = face.diffuse / M_PI;
-    payload.emission = face.emission / 2.0;
+    payload.emission = face.emission;
     payload.position = position;
-    payload.normal = normal;
+    payload.normal = -normal;
     payload.specular = face.specular;
     payload.transmittance = face.transmittance;
     payload.shininess = face.shininess;

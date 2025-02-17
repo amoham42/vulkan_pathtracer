@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) readonly uniform image2D inputImage;
+layout(binding = 1, rgba8) writeonly uniform image2D outputImage;
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    vec4 center = imageLoad(inputImage, pixelCoords);
+
+    vec4 color = vec4(0.0);
+    int count = 0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            color += imageLoad(inputImage, pixelCoords + ivec2(x, y));
+            count++;
+        }
+    }
+    color /= float(count);
+
+    imageStore(outputImage, pixelCoords, color);
+}

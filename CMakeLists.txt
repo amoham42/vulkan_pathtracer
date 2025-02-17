@@ -10,19 +10,16 @@ add_subdirectory(external/glfw)
 file(GLOB SHADERS shaders/*)
 add_executable(vulkan-tracer main.cpp ${SHADERS}
         src/mesh_loader.h
-        src/buffer.cpp
-        src/buffer.h
-        src/image.cpp
-        src/image.h
-        src/acceleration_structure.cpp
-        src/acceleration_structure.h
+        src/context.h
+        src/context.cpp
+        src/wavelet_denoise.h
 )
 
 source_group("Shader Files" FILES ${SHADERS})
 
 target_link_libraries(${PROJECT_NAME} PUBLIC glfw)
-target_include_directories(${PROJECT_NAME} PUBLIC
-        "$ENV{VULKAN_SDK}/Include"
-        "${PROJECT_SOURCE_DIR}/external/tinyobjloader"
+target_include_directories(${PROJECT_NAME} PUBLIC 
+    "$ENV{VULKAN_SDK}/Include"
+    "${PROJECT_SOURCE_DIR}/external/tinyobjloader"
         "${PROJECT_SOURCE_DIR}/external/glm"
 )

@@ -53,10 +53,11 @@ vec3 sampleDirection(float rand1, float rand2, vec3 normal, float shininess) {
 
 void main() {
 
-    int maxSamples = 32;
+    int maxSamples = 128;
     vec3 color = vec3(0.0);
     for(uint sampleNum = 0; sampleNum < maxSamples; sampleNum++) {
- 
+
+
         uvec2 s = pcg2d(ivec2(gl_LaunchIDEXT.xy) * (sampleNum + maxSamples * frame + 1));
         uint seed = s.x + s.y;
 
@@ -66,7 +67,6 @@ void main() {
         float aspectRatio = float(gl_LaunchSizeEXT.x) / float(gl_LaunchSizeEXT.y);
         float scale = tan(radians(fov) * 0.5);
 
-        vec2 d = inUV * 2.0 - 1.0;
         d.x *= aspectRatio * scale;
         d.y *= scale;
         vec4 origin = vec4(cameraPosition, 1);
@@ -76,6 +76,15 @@ void main() {
         payload.done = false;
 
         for(uint depth = 0; depth < 8; depth++){
+            if (depth > 2) {
+                float maxComponent = max(weight.r, max(weight.g, weight.b));
+                float rrProbability = clamp(maxComponent, 0.1, 0.9);
+
+                if (rand(seed) > rrProbability) {
+                    break;
+                }
+                weight /= rrProbability;
+            }
             traceRayEXT(
                 topLevelAS,
                 gl_RayFlagsOpaqueEXT,

@@ -7,7 +7,6 @@ layout(location = 0) rayPayloadInEXT HitPayload payload;
 
 void main() {
     payload.emission = vec3(0.0, 0.0, 0.0);
-    payload.specular = vec3(0.0, 0.0, 0.0);
-    payload.brdf = vec3(0.0, 0.0, 0.0);
+
     payload.done = true;
 }
