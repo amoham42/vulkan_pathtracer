@@ -1,0 +1,157 @@
+#version 460
+#extension GL_EXT_ray_tracing : enable
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba8) uniform image2D outputImage;
+layout(push_constant) uniform PushConstants {
+    vec3 cameraPosition;
+    float fov;
+    float light_intensity;
+
+    int frame;
+    int accumulate;
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+
+void createCoordinateSystem(in vec3 N, out vec3 T, out vec3 B) {
+
+    if(abs(N.x) > abs(N.y)) T = vec3(N.z, 0, -N.x) / sqrt(N.x * N.x + N.z * N.z);
+    else T = vec3(0, -N.z, N.y) / sqrt(N.y * N.y + N.z * N.z);
+
+    B = cross(N, T);
+}
+
+vec3 sampleHemisphere_less(float rand1, float rand2) {
+    vec3 dir;
+    dir.x = cos(2 * M_PI * rand2) * sqrt(1 - rand1 * rand1);
+    dir.y = sin(2 * M_PI * rand2) * sqrt(1 - rand1 * rand1);
+    dir.z = rand1;
+    return dir;
+}
+
+vec3 sampleHemisphere(float rand1, float rand2, float shininess) {
+    float r = sqrt(rand1) / (shininess * 0.2);
+    float theta = 2.0 * M_PI * rand2;
+    
+    float x = r * cos(theta);
+    float y = r * sin(theta);
+    float z = sqrt(1.0 - rand1);
+    
+    return vec3(x, y, z);
+}
+
+vec3 sampleDirection(float rand1, float rand2, vec3 normal, float shininess) {
+    vec3 tangent;
+    vec3 bitangent;
+    createCoordinateSystem(normal, tangent, bitangent);
+    vec3 dir = sampleHemisphere(rand1, rand2, shininess);
+    return dir.x * tangent + dir.y * bitangent + dir.z * normal;
+}
+
+void main() {
+
+    int maxSamples = 32;
+    vec3 color = vec3(0.0);
+    for(uint sampleNum = 0; sampleNum < maxSamples; sampleNum++) {
+ 
+        uvec2 s = pcg2d(ivec2(gl_LaunchIDEXT.xy) * (sampleNum + maxSamples * frame + 1));
+        uint seed = s.x + s.y;
+
+        const vec2 screenPos = vec2(gl_LaunchIDEXT.xy) + vec2(rand(seed), rand(seed));
+        const vec2 inUV = screenPos / vec2(gl_LaunchSizeEXT.xy);
+        vec2 d = inUV * 2.0 - 1.0;
+        float aspectRatio = float(gl_LaunchSizeEXT.x) / float(gl_LaunchSizeEXT.y);
+        float scale = tan(radians(fov) * 0.5);
+
+        vec2 d = inUV * 2.0 - 1.0;
+        d.x *= aspectRatio * scale;
+        d.y *= scale;
+        vec4 origin = vec4(cameraPosition, 1);
+        vec3 direction = normalize(vec3(d.x, d.y, -1));
+
+        vec3 weight = vec3(1.0);
+        payload.done = false;
+
+        for(uint depth = 0; depth < 8; depth++){
+            traceRayEXT(
+                topLevelAS,
+                gl_RayFlagsOpaqueEXT,
+                0xff, // cullMask
+                0,    // sbtRecordOffset
+                0,    // sbtRecordStride
+                0,    // missIndex
+                origin.xyz,
+                0.001,
+                direction.xyz,
+                1000.0,
+                0     // payloadLocation
+            );
+            color += weight * payload.emission * light_intensity;
+
+            origin.xyz = payload.position;
+            if (payload.illum == 5.0) {
+                direction.xyz = reflect(direction.xyz, payload.normal);
+                weight *= payload.specular;
+            } else if (payload.illum == 2.0) {
+                direction.xyz = sampleDirection(rand(seed), rand(seed), payload.normal, 5.0);
+                float pdf = 1.0 / (2.0 * M_PI);
+                weight *= payload.brdf * dot(direction.xyz, payload.normal) / pdf;
+            } 
+            else if (payload.illum == 3.0) {
+                direction.xyz = sampleDirection(rand(seed), rand(seed), payload.normal, payload.shininess);
+                float pdf = 1.0 / (2.0 * M_PI);
+                weight *= payload.brdf * dot(direction.xyz, payload.normal) / pdf;
+            } else if (payload.illum == 7.0) {
+                float cosi = dot(direction.xyz, payload.normal);
+                float etai = 1.0;          // Air IOR
+                float etat = payload.ior;
+                vec3 n = payload.normal;
+
+                if (cosi >= 0.0) {
+                    float temp = etai;
+                    etai = etat * 0.94;
+                    etat = temp * 1.06;
+                    n = -payload.normal;
+                } else {
+                    cosi = -cosi;
+                }
+
+                float eta = etai / etat;
+                float k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+
+                vec3 refracted;
+                if (k >= 0.0) { refracted = normalize(eta * direction.xyz + (eta * cosi - sqrt(k)) * n); } 
+                else { refracted = reflect(direction.xyz, payload.normal); }
+
+                vec3 reflected = reflect(direction.xyz, payload.normal);
+
+                float R0 = pow((etai - etat) / (etai + etat), 2.0);
+                float fresnel = R0 + (1.0 - R0) * pow(1.0 - cosi, 5.0);
+                fresnel = clamp(fresnel + 0.1, 0.0, 1.0);
+
+                if (rand(seed) < fresnel) {
+                    direction.xyz = reflected;
+                    weight *= payload.specular * payload.ior;
+                } else {
+                    direction.xyz = refracted;
+                    weight *= payload.transmittance * 10.0;
+                }
+            }
+            if(payload.done){
+                break;
+            }
+        }
+    }
+    color /= maxSamples;
+
+   vec4 oldColor = imageLoad(outputImage, ivec2(gl_LaunchIDEXT.xy));
+    vec4 newColor = vec4(color, 1.0);
+    if(accumulate == 1) {
+       newColor = (oldColor * frame + newColor) / (frame + 1);
+
+    }
+    imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), newColor);
+}
