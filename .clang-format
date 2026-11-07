@@ -1,0 +1,15 @@
+# Matches the existing code. Format only the lines you touch (e.g. git clang-format);
+# the tree is not mass-formatted.
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 130
+AccessModifierOffset: -4
+IndentCaseLabels: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortLambdasOnASingleLine: All
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
