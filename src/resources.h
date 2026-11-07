@@ -2,6 +2,8 @@
 
 #include "context.h"
 
+#include <cstdint>
+
 /// A buffer and its memory. Device-local buffers are filled through a staging copy, so big meshes
 /// live in VRAM instead of being read across PCIe on every ray.
 class Buffer {

@@ -7,10 +7,15 @@
 
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
