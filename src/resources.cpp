@@ -1,6 +1,8 @@
 #include "resources.h"
 
+#include <array>
 #include <cstring>
+#include <stdexcept>
 
 namespace {
 using Usage = vk::BufferUsageFlagBits;

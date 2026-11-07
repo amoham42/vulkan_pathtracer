@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
