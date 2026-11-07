@@ -1,0 +1,7 @@
+build*/
+*.spv
+output*.png
+screenshot_*.png
+.idea/
+.vs/
+cmake-build-*/

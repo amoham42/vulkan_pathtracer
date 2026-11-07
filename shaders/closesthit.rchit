@@ -1,85 +1,43 @@
 #version 460
-#extension GL_EXT_ray_tracing : enable
-#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-layout(binding = 2, set = 0) buffer Vertices{float vertices[];};
-layout(binding = 3, set = 0) buffer Indices{uint indices[];};
-layout(binding = 4, set = 0) buffer Faces{float faces[];};
+layout(set = 0, binding = 2, scalar) readonly buffer Vertices { GpuVertex vertices[]; };
+layout(set = 0, binding = 3) readonly buffer Indices { uint indices[]; };
+layout(set = 0, binding = 5) readonly buffer MaterialIds { uint materialIds[]; };
 
-layout(location = 0) rayPayloadInEXT HitPayload payload;
-hitAttributeEXT vec3 attribs;
-
-struct Vertex {
-    vec3 position;
-    vec3 normal;
-};
-
-struct Face {
-    vec3 diffuse;
-    vec3 emission;
-    vec3 specular;
-    vec3 transmittance;
-    float shininess;
-    float ior;
-    float illum;
-};
-
-Vertex unpackVertex(uint index) {
-
-    uint stride = 6;
-    uint offset = index * stride;
-    Vertex v;
-    v.position = vec3(vertices[offset +  0], vertices[offset +  1], vertices[offset + 2]);
-    v.normal = vec3(vertices[offset +  3], vertices[offset +  4], vertices[offset + 5]);
-
-    return v;
-}
-
-Face unpackFace(uint index) {
-
-    uint stride = 15;
-    uint offset = index * stride;
-    Face f;
-    f.diffuse = vec3(faces[offset +  0], faces[offset +  1], faces[offset + 2]);
-    f.emission = vec3(faces[offset +  3], faces[offset +  4], faces[offset + 5]);
-    f.specular = vec3(faces[offset + 6], faces[offset + 7], faces[offset + 8]);
-    f.transmittance = vec3(faces[offset + 9], faces[offset + 10], faces[offset + 11]);
-    f.shininess = faces[offset + 12];
-    f.ior = faces[offset + 13];
-    f.illum = faces[offset + 14];
-    return f;
-}
-
-vec3 calcNormal(Vertex v0, Vertex v1, Vertex v2) {
-
-    vec3 e01 = v1.normal - v0.normal;
-    vec3 e02 = v2.normal - v0.normal;
-    return -normalize(cross(e01, e02));
-}
+layout(location = 0) rayPayloadInEXT HitPayload hit;
+hitAttributeEXT vec2 bary;
 
 void main() {
+    const uint tri = gl_PrimitiveID;
+    const GpuVertex v0 = vertices[indices[3 * tri + 0]];
+    const GpuVertex v1 = vertices[indices[3 * tri + 1]];
+    const GpuVertex v2 = vertices[indices[3 * tri + 2]];
+    const vec3 b = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-    const Vertex v0 = unpackVertex(indices[3 * gl_PrimitiveID + 0]);
-    const Vertex v1 = unpackVertex(indices[3 * gl_PrimitiveID + 1]);
-    const Vertex v2 = unpackVertex(indices[3 * gl_PrimitiveID + 2]);
+    const vec3 p0 = v0.position.xyz, p1 = v1.position.xyz, p2 = v2.position.xyz;
+    vec3 ng = normalize(cross(p1 - p0, p2 - p0));
+    vec3 ns = ng;
+    if (v0.normal.w > 0.0) {
+        const vec3 n = v0.normal.xyz * b.x + v1.normal.xyz * b.y + v2.normal.xyz * b.z;
+        if (dot(n, n) > 1e-12) ns = normalize(n);
+        // authored normals say which side is outside; make the winding agree with them
+        if (dot(ng, ns) < 0.0) ng = -ng;
+    }
 
-    const vec3 barycentricCoords = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
-    const vec3 position = v0.position * barycentricCoords.x +
-                          v1.position * barycentricCoords.y +
-                          v2.position * barycentricCoords.z;
-    const vec3 normal = v0.normal * barycentricCoords.x +
-                        v1.normal * barycentricCoords.y +
-                        v2.normal * barycentricCoords.z;
+    const bool front = dot(ng, gl_WorldRayDirectionEXT) < 0.0;
+    if (!front) {
+        ng = -ng;
+        ns = -ns;
+    }
 
-    const Face face = unpackFace(gl_PrimitiveID);
-    payload.brdf = face.diffuse / M_PI;
-    payload.emission = face.emission;
-    payload.position = position;
-    payload.normal = -normal;
-    payload.specular = face.specular;
-    payload.transmittance = face.transmittance;
-    payload.shininess = face.shininess;
-    payload.ior = face.ior;
-    payload.illum = face.illum;
+    hit.position = p0 * b.x + p1 * b.y + p2 * b.z;
+    hit.t = gl_HitTEXT;
+    hit.normal = ns;
+    hit.material = materialIds[tri];
+    hit.geoNormal = ng;
+    hit.frontFace = front ? 1u : 0u;
 }
