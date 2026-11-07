@@ -1,5 +1,10 @@
 # Vulkan Path Tracer
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%20%2B%20KHR__ray__tracing-AC162C?logo=vulkan&logoColor=white)
+![GLSL](https://img.shields.io/badge/shaders-GLSL-5586A4)
+
 A physically based path tracer built on Vulkan's hardware ray-tracing pipeline (`VK_KHR_ray_tracing_pipeline`). It renders progressively in a window at interactive rates, with an edge-aware wavelet denoiser running on the GPU, or offscreen to a PNG.
 
 ![Cornell box with a mirror sphere and a glass sphere](docs/images/sphere.jpg)
@@ -82,6 +87,8 @@ cmake --build build --config Release
 
 Shaders are compiled to SPIR-V by `glslc` as part of the build. Add `-DVPT_VALIDATION=ON` to enable the Khronos validation layer. The code runs clean under it.
 
+On Linux, GLFW needs the X11 and Wayland development packages (on Debian/Ubuntu: `libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev wayland-protocols`).
+
 ## Run
 
 ```sh
@@ -120,3 +127,7 @@ Run `--help` for all options: resolution, samples, path depth, camera position a
 - Schied et al., *Spatiotemporal Variance-Guided Filtering*, HPG 2017 (variance-scaled colour weight).
 - Wächter and Binder, *A Fast and Robust Method for Avoiding Self-Intersection*, Ray Tracing Gems (2019).
 - The [NVIDIA Vulkan ray tracing tutorial](https://nvpro-samples.github.io/vk_raytracing_tutorial_KHR/) and [Vulkan-Hpp](https://github.com/KhronosGroup/Vulkan-Hpp).
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE). Vendored libraries in `external/` keep their own licenses: [GLFW](external/glfw/LICENSE.md) (zlib), [GLM](external/glm/copying.txt) (MIT / Happy Bunny), [tinyobjloader](external/tinyobjloader/LICENSE) (MIT) and stb_image_write (MIT / public domain). The Cornell box models in `assets/CornellBox` are CC BY 3.0 ([details](assets/CornellBox/copyright.txt)).
