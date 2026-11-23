@@ -15,7 +15,8 @@ layout(push_constant) uniform Post {
     float normalPower;
     float sigmaDepth;
     float exposure;
-    int pad0, pad1;
+    uint totalSamples;
+    uint pad;
 } pc;
 
 vec3 aces(vec3 x) {

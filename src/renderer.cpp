@@ -1,11 +1,22 @@
 #include "renderer.h"
 
+#if defined(_MSC_VER)
+#pragma warning(push, 0)
+#endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+#include <glm/gtc/constants.hpp>
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,140 +29,181 @@ namespace {
 
 using Stage = vk::ShaderStageFlagBits;
 using DT = vk::DescriptorType;
+using PS = vk::PipelineStageFlagBits2;
+using A = vk::AccessFlagBits2;
 
 struct FramePush {
     glm::vec4 eye, right, up, forward;
-    uint32_t frame, spp, maxDepth, lightCount;
+    uint32_t prevSamples, spp, maxDepth, lightCount;
     float lightArea, clampLuminance;
-    uint32_t seed, pad;
+    uint32_t seed, frameIndex;
 };
 static_assert(sizeof(FramePush) == 96);
+static_assert(offsetof(FramePush, prevSamples) == 64);
+static_assert(offsetof(FramePush, lightArea) == 80);
 
 struct PostPush {
     int32_t stepWidth, demodulate;
     float sigmaColor, normalPower, sigmaDepth, exposure;
-    int32_t pad0, pad1;
+    uint32_t totalSamples, pad;
 };
+static_assert(sizeof(PostPush) == 32);
+static_assert(offsetof(PostPush, totalSamples) == 24);
 
 std::filesystem::path shaderDir() {
-    // next to the executable when installed, else the build tree
     std::error_code ec;
+    const auto exe = executableDir();
+    if (!exe.empty()) {
+        const auto besideExe = exe / "shaders";
+        if (std::filesystem::exists(besideExe / "raygen.rgen.spv", ec)) return besideExe;
+    }
     const auto local = std::filesystem::current_path(ec) / "shaders";
     if (std::filesystem::exists(local / "raygen.rgen.spv", ec)) return local;
     return VPT_SHADER_DIR;
 }
 
-vk::UniqueShaderModule loadShader(const Context& ctx, const char* name) {
+std::vector<uint32_t> readSpirv(const char* name) {
     const auto path = shaderDir() / (std::string(name) + ".spv");
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("missing shader " + path.string() + " (build the 'shaders' target)");
-    std::vector<char> code(static_cast<size_t>(file.tellg()));
+    const auto bytes = static_cast<size_t>(file.tellg());
+    if (bytes == 0 || (bytes % 4) != 0) throw std::runtime_error("corrupt SPIR-V file " + path.string());
+    std::vector<uint32_t> words(bytes / 4);
     file.seekg(0);
-    file.read(code.data(), static_cast<std::streamsize>(code.size()));
-    return ctx.device->createShaderModuleUnique({{}, code.size(), reinterpret_cast<const uint32_t*>(code.data())});
+    file.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(bytes));
+    return words;
 }
 
-uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
+uint32_t alignUp(uint32_t v, uint32_t a) noexcept { return (v + a - 1) & ~(a - 1); }
 
 constexpr int kAtrousPasses = 5;
 
+std::string lowercaseExt(const std::string& path) {
+    auto ext = std::filesystem::path(path).extension().string();
+    std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
 }  // namespace
 
-glm::vec3 Camera::forward() const {
+glm::vec3 Camera::forward() const noexcept {
     return {std::cos(pitch) * std::sin(yaw), std::sin(pitch), -std::cos(pitch) * std::cos(yaw)};
 }
 
-void Camera::lookAt(glm::vec3 target) {
-    const glm::vec3 d = glm::normalize(target - eye);
+Camera::Basis Camera::basis() const noexcept {
+    const glm::vec3 f = forward();
+    // Avoid degenerate cross product when looking straight up or down.
+    const glm::vec3 worldUp = std::abs(f.y) > 0.999f ? glm::vec3(0.0f, 0.0f, -1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+    const glm::vec3 r = glm::normalize(glm::cross(f, worldUp));
+    const glm::vec3 u = glm::cross(r, f);
+    return {f, r, u};
+}
+
+void Camera::lookAt(glm::vec3 target) noexcept {
+    const glm::vec3 diff = target - eye;
+    const float len = glm::length(diff);
+    if (len < 1e-6f) return;
+    const glm::vec3 d = diff / len;
     pitch = std::asin(glm::clamp(d.y, -1.0f, 1.0f));
     yaw = std::atan2(d.x, -d.z);
 }
 
-Renderer::Renderer(Context& context, const Scene& scene, const Options& o)
-    : ctx(context), extent_{o.width, o.height} {
-    denoise = o.denoise;
-    exposure = o.exposure;
-    maxDepth = o.maxDepth;
-    samplesPerFrame = o.samplesPerFrame;
-
-    // frame the scene unless told where to stand
+Renderer::Renderer(const Context& context, const Scene& scene, const Options& o)
+    : ctx_(context),
+      extent_{o.width, o.height},
+      denoise_(o.denoise),
+      exposure_(o.exposure),
+      clampLuminance_(o.clampLuminance.value_or(o.denoise ? 64.0f : 0.0f)),
+      maxDepth_(o.maxDepth),
+      samplesPerFrame_(o.samplesPerFrame) {
+    // Frame the scene unless told where to stand.
     const glm::vec3 lo = scene.boundsMin, hi = scene.boundsMax, center = 0.5f * (lo + hi), size = hi - lo;
-    sceneScale = glm::length(size);
-    camera.fovY = o.fov;
+    camera_.fovY = o.fov;
     if (o.eye) {
-        camera.eye = *o.eye;
-        camera.lookAt(o.target.value_or(center));
+        camera_.eye = *o.eye;
+        camera_.lookAt(o.target.value_or(center));
     } else {
         const float halfFov = glm::radians(o.fov) * 0.5f;
-        // fill the frame with the scene's front face (for a Cornell box: the opening)
         const float fit = 0.5f * std::min(size.y, size.x * float(o.height) / float(o.width)) / std::tan(halfFov);
-        camera.eye = center + glm::vec3(0.0f, 0.0f, 0.5f * size.z + fit);
-        camera.lookAt(o.target.value_or(center));
+        camera_.eye = center + glm::vec3(0.0f, 0.0f, 0.5f * size.z + fit);
+        camera_.lookAt(o.target.value_or(center));
     }
 
-    createImages();
-    createSceneBuffers(scene);
+    // Batch all image clears, geometry staging uploads, and BLAS/TLAS builds into ONE GPU submission.
+    UploadBatch batch(ctx_);
+    createImages(batch);
+    createSceneBuffers(batch, scene);
+    batch.flush();
+
     createRayTracingPipeline();
     createPostPipelines();
     createShaderBindingTable();
-    writeDescriptors();
-    timestamps = ctx.device->createQueryPoolUnique({{}, vk::QueryType::eTimestamp, 3});
+    createDescriptors();
+    timestamps_ = ctx_.device.createQueryPool({{}, vk::QueryType::eTimestamp, 3});
 }
 
-void Renderer::createImages() {
+void Renderer::createImages(UploadBatch& batch) {
     using U = vk::ImageUsageFlagBits;
     const auto usage = U::eStorage | U::eTransferDst | U::eTransferSrc;
-    accum = Image(ctx, extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    pingA = Image(ctx, extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    pingB = Image(ctx, extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    albedo = Image(ctx, extent_, vk::Format::eR16G16B16A16Sfloat, usage);
-    normalDepth = Image(ctx, extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    ldr = Image(ctx, extent_, vk::Format::eR8G8B8A8Unorm, usage);
+    accum_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    pingA_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    pingB_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    albedo_ = batch.createImage(extent_, vk::Format::eR16G16B16A16Sfloat, usage);
+    normalDepth_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    ldr_ = batch.createImage(extent_, vk::Format::eR8G8B8A8Unorm, usage);
 }
 
-void Renderer::createSceneBuffers(const Scene& scene) {
+void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
     using K = Buffer::Kind;
-    vertexBuffer = Buffer(ctx, K::GeometryInput, sizeof(GpuVertex) * scene.vertices.size(), scene.vertices.data());
-    indexBuffer = Buffer(ctx, K::GeometryInput, sizeof(uint32_t) * scene.indices.size(), scene.indices.data());
-    materialBuffer = Buffer(ctx, K::Storage, sizeof(GpuMaterial) * scene.materials.size(), scene.materials.data());
-    materialIdBuffer = Buffer(ctx, K::Storage, sizeof(uint32_t) * scene.materialIds.size(), scene.materialIds.data());
-    // never bind an empty buffer
-    const GpuLight none{0, 0.0f};
-    lightBuffer = scene.lights.empty() ? Buffer(ctx, K::Storage, sizeof(GpuLight), &none)
-                                       : Buffer(ctx, K::Storage, sizeof(GpuLight) * scene.lights.size(), scene.lights.data());
-    lightCount = static_cast<uint32_t>(scene.lights.size());
-    lightArea = scene.lightArea;
+    vertexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const GpuVertex>(scene.vertices));
+    indexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const uint32_t>(scene.indices));
+    materialBuffer_ = batch.createBuffer(K::Storage, std::span<const GpuMaterial>(scene.materials));
+    materialIdBuffer_ = batch.createBuffer(K::Storage, std::span<const uint32_t>(scene.materialIds));
+    const std::array<GpuLight, 1> fallbackLight{{{0, 0.0f}}};
+    lightBuffer_ = scene.lights.empty() ? batch.createBuffer(K::Storage, std::span<const GpuLight>(fallbackLight))
+                                        : batch.createBuffer(K::Storage, std::span<const GpuLight>(scene.lights));
+    lightCount_ = static_cast<uint32_t>(scene.lights.size());
+    lightArea_ = scene.lightArea;
 
-    // bottom level: the whole mesh as one opaque triangle geometry
+    // Ensure geometry transfers finish before BLAS build reads them.
+    batch.memoryBarrier(PS::eCopy, A::eTransferWrite, PS::eAccelerationStructureBuildKHR, A::eShaderRead);
+
     vk::AccelerationStructureGeometryTrianglesDataKHR triangles;
     triangles.setVertexFormat(vk::Format::eR32G32B32Sfloat)
-        .setVertexData(vertexBuffer.address)
+        .setVertexData(vertexBuffer_.address())
         .setVertexStride(sizeof(GpuVertex))
         .setMaxVertex(static_cast<uint32_t>(scene.vertices.size() - 1))
         .setIndexType(vk::IndexType::eUint32)
-        .setIndexData(indexBuffer.address);
-    vk::AccelerationStructureGeometryKHR blasGeometry(vk::GeometryTypeKHR::eTriangles, triangles, vk::GeometryFlagBitsKHR::eOpaque);
-    blas = Accel(ctx, blasGeometry, scene.triangleCount(), vk::AccelerationStructureTypeKHR::eBottomLevel);
+        .setIndexData(indexBuffer_.address());
+    const vk::AccelerationStructureGeometryKHR blasGeometry(vk::GeometryTypeKHR::eTriangles, triangles,
+                                                            vk::GeometryFlagBitsKHR::eOpaque);
+    blas_ = batch.buildAccel(blasGeometry, scene.triangleCount(), vk::AccelerationStructureTypeKHR::eBottomLevel);
 
-    // top level: one identity instance
-    vk::AccelerationStructureInstanceKHR instance;
+    // Prepare TLAS instance buffer and synchronize BLAS build + instance upload before TLAS build.
+    vk::AccelerationStructureInstanceKHR instance{};
     const vk::TransformMatrixKHR identity(std::array<std::array<float, 4>, 3>{
         std::array{1.0f, 0.0f, 0.0f, 0.0f}, std::array{0.0f, 1.0f, 0.0f, 0.0f}, std::array{0.0f, 0.0f, 1.0f, 0.0f}});
     instance.setTransform(identity)
         .setMask(0xFF)
         .setFlags(vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable)
-        .setAccelerationStructureReference(blas.address);
-    instanceBuffer = Buffer(ctx, K::GeometryInput, sizeof(instance), &instance);
-    vk::AccelerationStructureGeometryInstancesDataKHR instances(false, instanceBuffer.address);
-    vk::AccelerationStructureGeometryKHR tlasGeometry(vk::GeometryTypeKHR::eInstances, instances, vk::GeometryFlagBitsKHR::eOpaque);
-    tlas = Accel(ctx, tlasGeometry, 1, vk::AccelerationStructureTypeKHR::eTopLevel);
+        .setAccelerationStructureReference(blas_.address());
+    instanceBuffer_ = batch.createBuffer(K::GeometryInput, sizeof(instance), &instance);
+
+    batch.memoryBarrier(PS::eAccelerationStructureBuildKHR | PS::eCopy,
+                        A::eAccelerationStructureWriteKHR | A::eTransferWrite, PS::eAccelerationStructureBuildKHR,
+                        A::eAccelerationStructureReadKHR | A::eShaderRead);
+
+    const vk::AccelerationStructureGeometryInstancesDataKHR instances(false, instanceBuffer_.address());
+    const vk::AccelerationStructureGeometryKHR tlasGeometry(vk::GeometryTypeKHR::eInstances, instances,
+                                                            vk::GeometryFlagBitsKHR::eOpaque);
+    tlas_ = batch.buildAccel(tlasGeometry, 1, vk::AccelerationStructureTypeKHR::eTopLevel);
 }
 
 void Renderer::createRayTracingPipeline() {
     const auto rgen = Stage::eRaygenKHR, chit = Stage::eClosestHitKHR;
-    const std::vector<vk::DescriptorSetLayoutBinding> bindings{
+    const std::array<vk::DescriptorSetLayoutBinding, 9> bindings{{
         {0, DT::eAccelerationStructureKHR, 1, rgen},  // TLAS
-        {1, DT::eStorageImage, 1, rgen},              // accumulated radiance
+        {1, DT::eStorageImage, 1, rgen},              // accumulated radiance + E[L^2]
         {2, DT::eStorageBuffer, 1, rgen | chit},      // vertices
         {3, DT::eStorageBuffer, 1, rgen | chit},      // indices
         {4, DT::eStorageBuffer, 1, rgen},             // materials
@@ -159,21 +211,19 @@ void Renderer::createRayTracingPipeline() {
         {6, DT::eStorageBuffer, 1, rgen},             // emissive triangles
         {7, DT::eStorageImage, 1, rgen},              // albedo guide
         {8, DT::eStorageImage, 1, rgen},              // normal + depth guide
-    };
-    rtSetLayout = ctx.device->createDescriptorSetLayoutUnique({{}, bindings});
-    const vk::PushConstantRange push(rgen, 0, sizeof(FramePush));
-    rtLayout = ctx.device->createPipelineLayoutUnique({{}, *rtSetLayout, push});
-
-    const auto raygen = loadShader(ctx, "raygen.rgen");
-    const auto miss = loadShader(ctx, "miss.rmiss");
-    const auto shadowMiss = loadShader(ctx, "shadow.rmiss");
-    const auto closestHit = loadShader(ctx, "closesthit.rchit");
-    const std::array<vk::PipelineShaderStageCreateInfo, 4> stages{{
-        {{}, Stage::eRaygenKHR, *raygen, "main"},
-        {{}, Stage::eMissKHR, *miss, "main"},
-        {{}, Stage::eMissKHR, *shadowMiss, "main"},
-        {{}, Stage::eClosestHitKHR, *closestHit, "main"},
     }};
+    rtSetLayout_ = ctx_.device.createDescriptorSetLayout({{}, bindings});
+    const vk::PushConstantRange push(rgen, 0, sizeof(FramePush));
+    rtLayout_ = ctx_.device.createPipelineLayout({{}, *rtSetLayout_, push});
+
+    const std::array<std::vector<uint32_t>, 4> code{
+        readSpirv("raygen.rgen"),
+        readSpirv("miss.rmiss"),
+        readSpirv("shadow.rmiss"),
+        readSpirv("closesthit.rchit"),
+    };
+    const std::array<Stage, 4> stageFlags{Stage::eRaygenKHR, Stage::eMissKHR, Stage::eMissKHR, Stage::eClosestHitKHR};
+
     using G = vk::RayTracingShaderGroupTypeKHR;
     const std::array<vk::RayTracingShaderGroupCreateInfoKHR, 4> groups{{
         {G::eGeneral, 0, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR},
@@ -181,207 +231,365 @@ void Renderer::createRayTracingPipeline() {
         {G::eGeneral, 2, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR},
         {G::eTrianglesHitGroup, VK_SHADER_UNUSED_KHR, 3, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR},
     }};
-    vk::RayTracingPipelineCreateInfoKHR info;
-    info.setStages(stages).setGroups(groups).setMaxPipelineRayRecursionDepth(1).setLayout(*rtLayout);
-    auto result = ctx.device->createRayTracingPipelineKHRUnique(nullptr, nullptr, info);
-    if (result.result != vk::Result::eSuccess) throw std::runtime_error("ray-tracing pipeline creation failed");
-    rtPipeline = std::move(result.value);
+
+    if (ctx_.hasMaintenance5) {
+        // Vulkan 1.4-promoted maintenance5: inline ShaderModuleCreateInfo without temporary VkShaderModule objects.
+        std::array<vk::ShaderModuleCreateInfo, 4> modInfos;
+        std::array<vk::PipelineShaderStageCreateInfo, 4> stages;
+        for (size_t i = 0; i < 4; i++) {
+            modInfos[i] = vk::ShaderModuleCreateInfo({}, code[i]);
+            stages[i] = vk::PipelineShaderStageCreateInfo({}, stageFlags[i], {}, "main").setPNext(&modInfos[i]);
+        }
+        vk::RayTracingPipelineCreateInfoKHR info;
+        info.setStages(stages).setGroups(groups).setMaxPipelineRayRecursionDepth(1).setLayout(*rtLayout_);
+        rtPipeline_ = ctx_.device.createRayTracingPipelineKHR(nullptr, nullptr, info);
+    } else {
+        std::vector<vk::raii::ShaderModule> modules;
+        modules.reserve(4);
+        std::array<vk::PipelineShaderStageCreateInfo, 4> stages;
+        for (size_t i = 0; i < 4; i++) {
+            modules.push_back(ctx_.device.createShaderModule({{}, code[i]}));
+            stages[i] = vk::PipelineShaderStageCreateInfo({}, stageFlags[i], *modules.back(), "main");
+        }
+        vk::RayTracingPipelineCreateInfoKHR info;
+        info.setStages(stages).setGroups(groups).setMaxPipelineRayRecursionDepth(1).setLayout(*rtLayout_);
+        rtPipeline_ = ctx_.device.createRayTracingPipelineKHR(nullptr, nullptr, info);
+    }
 }
 
 void Renderer::createPostPipelines() {
-    std::vector<vk::DescriptorSetLayoutBinding> bindings;
-    for (uint32_t b = 0; b < 5; b++) bindings.push_back({b, DT::eStorageImage, 1, Stage::eCompute});
-    postSetLayout = ctx.device->createDescriptorSetLayoutUnique({{}, bindings});
+    std::array<vk::DescriptorSetLayoutBinding, 5> bindings{};
+    for (uint32_t b = 0; b < 5; b++) bindings[b] = {b, DT::eStorageImage, 1, Stage::eCompute};
+    // Vulkan 1.4-promoted push descriptors: bind ping-pong images inline without pre-allocating descriptor sets.
+    postSetLayout_ =
+        ctx_.device.createDescriptorSetLayout({vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR, bindings});
     const vk::PushConstantRange push(Stage::eCompute, 0, sizeof(PostPush));
-    postLayout = ctx.device->createPipelineLayoutUnique({{}, *postSetLayout, push});
+    postLayout_ = ctx_.device.createPipelineLayout({{}, *postSetLayout_, push});
 
     auto make = [&](const char* name) {
-        const auto module = loadShader(ctx, name);
-        vk::ComputePipelineCreateInfo info({}, {{}, Stage::eCompute, *module, "main"}, *postLayout);
-        auto result = ctx.device->createComputePipelineUnique(nullptr, info);
-        if (result.result != vk::Result::eSuccess) throw std::runtime_error(std::string("failed to build ") + name);
-        return std::move(result.value);
+        const auto code = readSpirv(name);
+        if (ctx_.hasMaintenance5) {
+            const vk::ShaderModuleCreateInfo modInfo({}, code);
+            const auto stage = vk::PipelineShaderStageCreateInfo({}, Stage::eCompute, {}, "main").setPNext(&modInfo);
+            return ctx_.device.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo({}, stage, *postLayout_));
+        }
+        const auto mod = ctx_.device.createShaderModule({{}, code});
+        const vk::PipelineShaderStageCreateInfo stage({}, Stage::eCompute, *mod, "main");
+        return ctx_.device.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo({}, stage, *postLayout_));
     };
-    atrousPipeline = make("atrous.comp");
-    tonemapPipeline = make("tonemap.comp");
+    atrousPipeline_ = make("atrous.comp");
+    tonemapPipeline_ = make("tonemap.comp");
 }
 
-// One buffer holding [raygen][miss, shadow miss][hit], each region aligned for the hardware.
 void Renderer::createShaderBindingTable() {
-    const auto& rt = ctx.rtProperties;
+    const auto& rt = ctx_.rtProperties;
     const uint32_t handleSize = rt.shaderGroupHandleSize;
     const uint32_t entry = alignUp(handleSize, rt.shaderGroupHandleAlignment);
     const uint32_t base = rt.shaderGroupBaseAlignment;
 
-    raygenRegion = vk::StridedDeviceAddressRegionKHR{0, alignUp(entry, base), alignUp(entry, base)};
-    missRegion = vk::StridedDeviceAddressRegionKHR{0, entry, alignUp(2 * entry, base)};
-    hitRegion = vk::StridedDeviceAddressRegionKHR{0, entry, alignUp(entry, base)};
+    raygenRegion_ = vk::StridedDeviceAddressRegionKHR{0, alignUp(entry, base), alignUp(entry, base)};
+    missRegion_ = vk::StridedDeviceAddressRegionKHR{0, entry, alignUp(2 * entry, base)};
+    hitRegion_ = vk::StridedDeviceAddressRegionKHR{0, entry, alignUp(entry, base)};
 
     constexpr uint32_t groupCount = 4;
-    std::vector<uint8_t> handles(groupCount * handleSize);
-    if (ctx.device->getRayTracingShaderGroupHandlesKHR(*rtPipeline, 0, groupCount, handles.size(), handles.data()) !=
-        vk::Result::eSuccess)
-        throw std::runtime_error("could not read shader group handles");
+    const auto handles = rtPipeline_.getRayTracingShaderGroupHandlesKHR<uint8_t>(0, groupCount, groupCount * handleSize);
 
-    const vk::DeviceSize total = raygenRegion.size + missRegion.size + hitRegion.size + base;
-    sbt = Buffer(ctx, Buffer::Kind::ShaderBindingTable, total);
-    const vk::DeviceAddress start = (sbt.address + base - 1) & ~vk::DeviceAddress(base - 1);
-    auto* dst = static_cast<uint8_t*>(sbt.map()) + (start - sbt.address);
+    const vk::DeviceSize total = raygenRegion_.size + missRegion_.size + hitRegion_.size + base;
+    sbt_ = Buffer(ctx_, Buffer::Kind::ShaderBindingTable, total);
+    const vk::DeviceAddress start = (sbt_.address() + base - 1) & ~vk::DeviceAddress(base - 1);
+    auto* dst = static_cast<uint8_t*>(sbt_.mapped()) + (start - sbt_.address());
     std::memcpy(dst, handles.data() + 0 * handleSize, handleSize);
-    std::memcpy(dst + raygenRegion.size, handles.data() + 1 * handleSize, handleSize);
-    std::memcpy(dst + raygenRegion.size + entry, handles.data() + 2 * handleSize, handleSize);
-    std::memcpy(dst + raygenRegion.size + missRegion.size, handles.data() + 3 * handleSize, handleSize);
-    sbt.unmap();
+    std::memcpy(dst + raygenRegion_.size, handles.data() + 1 * handleSize, handleSize);
+    std::memcpy(dst + raygenRegion_.size + entry, handles.data() + 2 * handleSize, handleSize);
+    std::memcpy(dst + raygenRegion_.size + missRegion_.size, handles.data() + 3 * handleSize, handleSize);
+    sbt_.flush();
 
-    raygenRegion.deviceAddress = start;
-    missRegion.deviceAddress = start + raygenRegion.size;
-    hitRegion.deviceAddress = start + raygenRegion.size + missRegion.size;
+    raygenRegion_.deviceAddress = start;
+    missRegion_.deviceAddress = start + raygenRegion_.size;
+    hitRegion_.deviceAddress = start + raygenRegion_.size + missRegion_.size;
 }
 
-void Renderer::writeDescriptors() {
+void Renderer::createDescriptors() {
     const std::array<vk::DescriptorPoolSize, 3> sizes{{
         {DT::eAccelerationStructureKHR, 1},
-        {DT::eStorageImage, 3 + 3 * 5},
+        {DT::eStorageImage, 3},
         {DT::eStorageBuffer, 5},
     }};
-    descriptorPool = ctx.device->createDescriptorPoolUnique({vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 4, sizes});
+    descriptorPool_ = ctx_.device.createDescriptorPool({vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, sizes});
+    rtSet_ = std::move(ctx_.device.allocateDescriptorSets({*descriptorPool_, *rtSetLayout_}).front());
 
-    rtSet = std::move(ctx.device->allocateDescriptorSetsUnique({*descriptorPool, *rtSetLayout}).front());
-    const std::array postLayouts{*postSetLayout, *postSetLayout, *postSetLayout};
-    postSets = ctx.device->allocateDescriptorSetsUnique({*descriptorPool, postLayouts});
+    const auto tlasHandle = tlas_.handle();
+    const vk::WriteDescriptorSetAccelerationStructureKHR tlasInfo(tlasHandle);
+    const auto vInfo = vertexBuffer_.descriptor();
+    const auto iInfo = indexBuffer_.descriptor();
+    const auto mInfo = materialBuffer_.descriptor();
+    const auto midInfo = materialIdBuffer_.descriptor();
+    const auto lInfo = lightBuffer_.descriptor();
+    const auto accumInfo = accum_.descriptor();
+    const auto albedoInfo = albedo_.descriptor();
+    const auto ndInfo = normalDepth_.descriptor();
 
-    vk::WriteDescriptorSetAccelerationStructureKHR tlasInfo(*tlas.handle);
-    const auto accumInfo = accum.descriptor(), albedoInfo = albedo.descriptor(), ndInfo = normalDepth.descriptor();
-    const auto vInfo = vertexBuffer.descriptor(), iInfo = indexBuffer.descriptor(), mInfo = materialBuffer.descriptor(),
-               midInfo = materialIdBuffer.descriptor(), lInfo = lightBuffer.descriptor();
+    const std::array<vk::WriteDescriptorSet, 9> writes{{
+        vk::WriteDescriptorSet(*rtSet_, 0, 0, 1, DT::eAccelerationStructureKHR).setPNext(&tlasInfo),
+        vk::WriteDescriptorSet(*rtSet_, 1, 0, DT::eStorageImage, accumInfo),
+        vk::WriteDescriptorSet(*rtSet_, 2, 0, DT::eStorageBuffer, {}, vInfo),
+        vk::WriteDescriptorSet(*rtSet_, 3, 0, DT::eStorageBuffer, {}, iInfo),
+        vk::WriteDescriptorSet(*rtSet_, 4, 0, DT::eStorageBuffer, {}, mInfo),
+        vk::WriteDescriptorSet(*rtSet_, 5, 0, DT::eStorageBuffer, {}, midInfo),
+        vk::WriteDescriptorSet(*rtSet_, 6, 0, DT::eStorageBuffer, {}, lInfo),
+        vk::WriteDescriptorSet(*rtSet_, 7, 0, DT::eStorageImage, albedoInfo),
+        vk::WriteDescriptorSet(*rtSet_, 8, 0, DT::eStorageImage, ndInfo),
+    }};
+    ctx_.device.updateDescriptorSets(writes, nullptr);
+}
 
-    std::vector<vk::WriteDescriptorSet> writes{
-        vk::WriteDescriptorSet(*rtSet, 0, 0, 1, DT::eAccelerationStructureKHR).setPNext(&tlasInfo),
-        vk::WriteDescriptorSet(*rtSet, 1, 0, DT::eStorageImage, accumInfo),
-        vk::WriteDescriptorSet(*rtSet, 2, 0, DT::eStorageBuffer, {}, vInfo),
-        vk::WriteDescriptorSet(*rtSet, 3, 0, DT::eStorageBuffer, {}, iInfo),
-        vk::WriteDescriptorSet(*rtSet, 4, 0, DT::eStorageBuffer, {}, mInfo),
-        vk::WriteDescriptorSet(*rtSet, 5, 0, DT::eStorageBuffer, {}, midInfo),
-        vk::WriteDescriptorSet(*rtSet, 6, 0, DT::eStorageBuffer, {}, lInfo),
-        vk::WriteDescriptorSet(*rtSet, 7, 0, DT::eStorageImage, albedoInfo),
-        vk::WriteDescriptorSet(*rtSet, 8, 0, DT::eStorageImage, ndInfo),
+void Renderer::updateRtImageDescriptors() {
+    const auto accumInfo = accum_.descriptor();
+    const auto albedoInfo = albedo_.descriptor();
+    const auto ndInfo = normalDepth_.descriptor();
+    const std::array<vk::WriteDescriptorSet, 3> writes{{
+        vk::WriteDescriptorSet(*rtSet_, 1, 0, DT::eStorageImage, accumInfo),
+        vk::WriteDescriptorSet(*rtSet_, 7, 0, DT::eStorageImage, albedoInfo),
+        vk::WriteDescriptorSet(*rtSet_, 8, 0, DT::eStorageImage, ndInfo),
+    }};
+    ctx_.device.updateDescriptorSets(writes, nullptr);
+}
+
+void Renderer::resize(vk::Extent2D newExtent) {
+    if (newExtent.width == 0 || newExtent.height == 0 || newExtent == extent_) return;
+    ctx_.device.waitIdle();
+    extent_ = newExtent;
+    UploadBatch batch(ctx_);
+    createImages(batch);
+    batch.flush();
+    updateRtImageDescriptors();
+    reset();
+}
+
+void Renderer::recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp) {
+    pendingSpp_ = spp > 0 ? spp : samplesPerFrame_;
+    cmd.resetQueryPool(*timestamps_, 0, 3);
+    cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, 0);
+
+    const auto [f, r, u] = camera_.basis();
+    const FramePush push{
+        .eye = glm::vec4(camera_.eye, std::tan(glm::radians(camera_.fovY) * 0.5f)),
+        .right = glm::vec4(r, float(extent_.width) / float(extent_.height)),
+        .up = glm::vec4(u, 0.0f),
+        .forward = glm::vec4(f, 0.0f),
+        .prevSamples = accumulatedSamples_,
+        .spp = pendingSpp_,
+        .maxDepth = maxDepth_,
+        .lightCount = lightCount_,
+        .lightArea = lightArea_,
+        .clampLuminance = clampLuminance_,
+        .seed = 0x9E3779B9u,
+        .frameIndex = frameIndex_,
     };
 
-    // ping-pong: accum -> A, A -> B, B -> A
-    const std::array<std::pair<const Image*, const Image*>, 3> chain{{{&accum, &pingA}, {&pingA, &pingB}, {&pingB, &pingA}}};
-    std::vector<std::array<vk::DescriptorImageInfo, 5>> infos(3);
-    for (size_t s = 0; s < 3; s++) {
-        infos[s] = {chain[s].first->descriptor(), chain[s].second->descriptor(), albedoInfo, ndInfo, ldr.descriptor()};
-        for (uint32_t b = 0; b < 5; b++) writes.emplace_back(*postSets[s], b, 0, DT::eStorageImage, infos[s][b]);
-    }
-    ctx.device->updateDescriptorSets(writes, nullptr);
-}
-
-void Renderer::record(vk::CommandBuffer cmd) {
-    using PS = vk::PipelineStageFlagBits2;
-    using A = vk::AccessFlagBits2;
-
-    cmd.resetQueryPool(*timestamps, 0, 3);
-    cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps, 0);
-
-    // ---- trace ----
-    const glm::vec3 f = camera.forward();
-    const glm::vec3 r = glm::normalize(glm::cross(f, glm::vec3(0.0f, 1.0f, 0.0f)));
-    const glm::vec3 u = glm::cross(r, f);
-    FramePush push{};
-    push.eye = glm::vec4(camera.eye, std::tan(glm::radians(camera.fovY) * 0.5f));
-    push.right = glm::vec4(r, float(extent_.width) / float(extent_.height));
-    push.up = glm::vec4(u, 0.0f);
-    push.forward = glm::vec4(f, 0.0f);
-    push.frame = frame;
-    push.spp = samplesPerFrame;
-    push.maxDepth = maxDepth;
-    push.lightCount = lightCount;
-    push.lightArea = lightArea;
-    push.clampLuminance = 64.0f;
-    push.seed = 0x9E3779B9u;
-
-    memoryBarrier(cmd, PS::eComputeShader | PS::eTransfer, A::eShaderStorageRead | A::eTransferRead, PS::eRayTracingShaderKHR,
+    memoryBarrier(cmd, PS::eRayTracingShaderKHR | PS::eComputeShader | PS::eTransfer,
+                  A::eShaderStorageWrite | A::eShaderStorageRead | A::eTransferRead, PS::eRayTracingShaderKHR,
                   A::eShaderStorageWrite | A::eShaderStorageRead);
-    cmd.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtLayout, 0, *rtSet, nullptr);
-    cmd.pushConstants(*rtLayout, Stage::eRaygenKHR, 0, sizeof(push), &push);
-    cmd.traceRaysKHR(raygenRegion, missRegion, hitRegion, callableRegion, extent_.width, extent_.height, 1);
-    cmd.writeTimestamp2(PS::eRayTracingShaderKHR, *timestamps, 1);
-
-    memoryBarrier(cmd, PS::eRayTracingShaderKHR, A::eShaderStorageWrite, PS::eComputeShader, A::eShaderStorageRead);
-    recordPost(cmd);
-    cmd.writeTimestamp2(PS::eComputeShader, *timestamps, 2);
-    timestampsWritten = true;
+    cmd.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline_);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtLayout_, 0, *rtSet_, nullptr);
+    cmd.pushConstants<FramePush>(*rtLayout_, Stage::eRaygenKHR, 0, push);
+    cmd.traceRaysKHR(raygenRegion_, missRegion_, hitRegion_, callableRegion_, extent_.width, extent_.height, 1);
+    cmd.writeTimestamp2(PS::eRayTracingShaderKHR, *timestamps_, 1);
 }
 
-void Renderer::postProcess() {
-    ctx.oneTimeSubmit([&](vk::CommandBuffer cmd) { recordPost(cmd); });
-}
-
-// denoise (optional) + tonemap into `ldr`
-void Renderer::recordPost(vk::CommandBuffer cmd) {
-    using PS = vk::PipelineStageFlagBits2;
-    using A = vk::AccessFlagBits2;
+void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps) {
     const uint32_t gx = (extent_.width + 15) / 16, gy = (extent_.height + 15) / 16;
-    PostPush post{};
-    post.normalPower = 64.0f;
-    post.sigmaDepth = 0.05f;
-    post.exposure = exposure;
+    const auto albInfo = albedo_.descriptor();
+    const auto ndInfo = normalDepth_.descriptor();
+    const auto ldrInfo = ldr_.descriptor();
 
-    uint32_t tonemapSet = 0;
-    if (denoise) {
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPipeline);
-        const std::array<uint32_t, kAtrousPasses> sets{0, 1, 2, 1, 2};  // ends in A
+    auto pushBindings = [&](const Image& srcImg, const Image& dstImg) {
+        const auto srcInfo = srcImg.descriptor();
+        const auto dstInfo = dstImg.descriptor();
+        const std::array<vk::WriteDescriptorSet, 5> writes{{
+            vk::WriteDescriptorSet({}, 0, 0, DT::eStorageImage, srcInfo),
+            vk::WriteDescriptorSet({}, 1, 0, DT::eStorageImage, dstInfo),
+            vk::WriteDescriptorSet({}, 2, 0, DT::eStorageImage, albInfo),
+            vk::WriteDescriptorSet({}, 3, 0, DT::eStorageImage, ndInfo),
+            vk::WriteDescriptorSet({}, 4, 0, DT::eStorageImage, ldrInfo),
+        }};
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *postLayout_, 0, writes);
+    };
+
+    if (writeTimestamps) {
+        cmd.resetQueryPool(*timestamps_, 1, 2);
+        cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, 1);
+    }
+
+    PostPush post{
+        .stepWidth = 1,
+        .demodulate = 0,
+        .sigmaColor = 4.0f,
+        .normalPower = 64.0f,
+        .sigmaDepth = 0.05f,
+        .exposure = exposure_,
+        .totalSamples = std::max(1u, accumulatedSamples_ + pendingSpp_),
+        .pad = 0,
+    };
+
+    const Image* tonemapSrc = &accum_;
+    if (denoise_) {
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPipeline_);
+        // 5 passes: accum->A, A->B, B->A, A->B, B->A (ends in A)
+        const std::array<std::pair<const Image*, const Image*>, kAtrousPasses> passes{{
+            {&accum_, &pingA_},
+            {&pingA_, &pingB_},
+            {&pingB_, &pingA_},
+            {&pingA_, &pingB_},
+            {&pingB_, &pingA_},
+        }};
         for (int pass = 0; pass < kAtrousPasses; pass++) {
             post.stepWidth = 1 << pass;
             post.demodulate = pass == 0 ? 1 : 0;
-            post.sigmaColor = 4.0f;  // in local standard deviations; the variance itself drops pass by pass
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *postLayout, 0, *postSets[sets[pass]], nullptr);
-            cmd.pushConstants(*postLayout, Stage::eCompute, 0, sizeof(post), &post);
+            pushBindings(*passes[pass].first, *passes[pass].second);
+            cmd.pushConstants<PostPush>(*postLayout_, Stage::eCompute, 0, post);
             cmd.dispatch(gx, gy, 1);
             memoryBarrier(cmd, PS::eComputeShader, A::eShaderStorageWrite, PS::eComputeShader, A::eShaderStorageRead);
         }
-        tonemapSet = 1;  // reads A
+        tonemapSrc = &pingA_;
     }
-    post.demodulate = denoise ? 1 : 0;
-    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *tonemapPipeline);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *postLayout, 0, *postSets[tonemapSet], nullptr);
-    cmd.pushConstants(*postLayout, Stage::eCompute, 0, sizeof(post), &post);
+
+    post.demodulate = denoise_ ? 1 : 0;
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *tonemapPipeline_);
+    pushBindings(*tonemapSrc, pingB_);
+    cmd.pushConstants<PostPush>(*postLayout_, Stage::eCompute, 0, post);
     cmd.dispatch(gx, gy, 1);
     memoryBarrier(cmd, PS::eComputeShader, A::eShaderStorageWrite, PS::eTransfer | PS::eComputeShader,
                   A::eTransferRead | A::eShaderStorageRead);
+
+    cmd.writeTimestamp2(PS::eComputeShader, *timestamps_, 2);
+}
+
+void Renderer::recordFrame(const vk::raii::CommandBuffer& cmd) {
+    recordTrace(cmd);
+    memoryBarrier(cmd, PS::eRayTracingShaderKHR, A::eShaderStorageWrite, PS::eComputeShader, A::eShaderStorageRead);
+    recordPost(cmd, false);
+}
+
+void Renderer::postProcess() {
+    pendingSpp_ = 0;
+    ctx_.oneTimeSubmit([&](const vk::raii::CommandBuffer& cmd) {
+        memoryBarrier(cmd, PS::eRayTracingShaderKHR | PS::eComputeShader, A::eShaderStorageWrite, PS::eComputeShader,
+                      A::eShaderStorageRead);
+        recordPost(cmd, true);
+    });
+    const auto [res, t] = timestamps_.getResults<uint64_t>(
+        1, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    if (res == vk::Result::eSuccess) {
+        const double period = ctx_.properties.limits.timestampPeriod * 1e-6;
+        postMs_ = double(t[1] - t[0]) * period;
+    }
+}
+
+void Renderer::finishTrace() {
+    const auto [res, t] = timestamps_.getResults<uint64_t>(
+        0, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    if (res == vk::Result::eSuccess) {
+        const double period = ctx_.properties.limits.timestampPeriod * 1e-6;
+        traceMs_ = double(t[1] - t[0]) * period;
+    }
+    accumulatedSamples_ += pendingSpp_;
+    pendingSpp_ = 0;
+    frameIndex_++;
 }
 
 void Renderer::finishFrame() {
-    if (timestampsWritten) {
-        std::array<uint64_t, 3> t{};
-        if (ctx.device->getQueryPoolResults(*timestamps, 0, 3, sizeof(t), t.data(), sizeof(uint64_t),
-                                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait) ==
-            vk::Result::eSuccess) {
-            const double period = ctx.properties.limits.timestampPeriod * 1e-6;  // ns -> ms
-            traceMs = double(t[1] - t[0]) * period;
-            postMs = double(t[2] - t[1]) * period;
-        }
+    const auto [res, t] = timestamps_.getResults<uint64_t>(
+        0, 3, 3 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    if (res == vk::Result::eSuccess) {
+        const double period = ctx_.properties.limits.timestampPeriod * 1e-6;
+        traceMs_ = double(t[1] - t[0]) * period;
+        postMs_ = double(t[2] - t[1]) * period;
     }
-    frame++;
+    accumulatedSamples_ += pendingSpp_;
+    pendingSpp_ = 0;
+    frameIndex_++;
 }
 
-std::vector<uint8_t> Renderer::readLdr() {
+std::vector<uint8_t> Renderer::readLdr() const {
     const vk::DeviceSize bytes = vk::DeviceSize(extent_.width) * extent_.height * 4;
-    Buffer readback(ctx, Buffer::Kind::Readback, bytes);
-    ctx.oneTimeSubmit([&](vk::CommandBuffer cmd) {
-        vk::BufferImageCopy region(0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0}, {extent_.width, extent_.height, 1});
-        cmd.copyImageToBuffer(*ldr.image, vk::ImageLayout::eGeneral, *readback.buffer, region);
+    Buffer readback(ctx_, Buffer::Kind::Readback, bytes);
+    ctx_.oneTimeSubmit([&](const vk::raii::CommandBuffer& cmd) {
+        const vk::BufferImageCopy region(0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0},
+                                         {extent_.width, extent_.height, 1});
+        cmd.copyImageToBuffer(ldr_.handle(), vk::ImageLayout::eGeneral, readback.handle(), region);
     });
-    std::vector<uint8_t> pixels(bytes);
-    std::memcpy(pixels.data(), readback.map(), bytes);
-    readback.unmap();
+    readback.invalidate();
+    std::vector<uint8_t> pixels(static_cast<size_t>(bytes));
+    std::memcpy(pixels.data(), readback.mapped(), static_cast<size_t>(bytes));
     return pixels;
 }
 
-void Renderer::savePng(const std::string& path) {
-    const auto pixels = readLdr();
-    if (!stbi_write_png(path.c_str(), int(extent_.width), int(extent_.height), 4, pixels.data(), int(extent_.width * 4)))
-        throw std::runtime_error("could not write " + path);
+std::vector<float> Renderer::readHdrRgb() const {
+    const size_t pixelCount = size_t(extent_.width) * extent_.height;
+    const vk::DeviceSize hdrBytes = vk::DeviceSize(pixelCount) * 4 * sizeof(float);
+    const Image& src = denoise_ ? pingA_ : accum_;
+    Buffer hdrBuf(ctx_, Buffer::Kind::Readback, hdrBytes);
+    Buffer albBuf;
+    if (denoise_) albBuf = Buffer(ctx_, Buffer::Kind::Readback, vk::DeviceSize(pixelCount) * 4 * sizeof(uint16_t));
+
+    ctx_.oneTimeSubmit([&](const vk::raii::CommandBuffer& cmd) {
+        const vk::BufferImageCopy region(0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0},
+                                         {extent_.width, extent_.height, 1});
+        cmd.copyImageToBuffer(src.handle(), vk::ImageLayout::eGeneral, hdrBuf.handle(), region);
+        if (denoise_) cmd.copyImageToBuffer(albedo_.handle(), vk::ImageLayout::eGeneral, albBuf.handle(), region);
+    });
+    hdrBuf.invalidate();
+    const auto* rgba = static_cast<const float*>(hdrBuf.mapped());
+
+    auto f16ToF32 = [](uint16_t h) -> float {
+        const uint32_t sign = (uint32_t(h & 0x8000u)) << 16;
+        uint32_t exp = (h >> 10) & 0x1Fu;
+        uint32_t mant = h & 0x03FFu;
+        uint32_t bits = 0;
+        if (exp == 0) {
+            if (mant == 0) bits = sign;
+            else {
+                exp = 127 - 14;
+                while ((mant & 0x0400u) == 0) { mant <<= 1; exp--; }
+                mant &= 0x03FFu;
+                bits = sign | (exp << 23) | (mant << 13);
+            }
+        } else if (exp == 31) {
+            bits = sign | 0x7F800000u | (mant << 13);
+        } else {
+            bits = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+        return std::bit_cast<float>(bits);
+    };
+
+    const uint16_t* alb = denoise_ ? static_cast<const uint16_t*>(albBuf.mapped()) : nullptr;
+    if (denoise_) albBuf.invalidate();
+
+    std::vector<float> rgb(pixelCount * 3);
+    for (size_t i = 0; i < pixelCount; i++) {
+        for (size_t c = 0; c < 3; c++) {
+            float v = rgba[4 * i + c] * exposure_;
+            if (alb) v *= std::max(f16ToF32(alb[4 * i + c]), 1e-3f);
+            rgb[3 * i + c] = std::max(v, 0.0f);
+        }
+    }
+    return rgb;
+}
+
+void Renderer::saveImage(const std::string& path) const {
+    const auto ext = lowercaseExt(path);
+    int ok = 0;
+    if (ext == ".hdr") {
+        const auto rgb = readHdrRgb();
+        ok = stbi_write_hdr(path.c_str(), int(extent_.width), int(extent_.height), 3, rgb.data());
+    } else if (ext == ".jpg" || ext == ".jpeg") {
+        const auto pixels = readLdr();
+        ok = stbi_write_jpg(path.c_str(), int(extent_.width), int(extent_.height), 4, pixels.data(), 95);
+    } else {
+        const auto pixels = readLdr();
+        ok = stbi_write_png(path.c_str(), int(extent_.width), int(extent_.height), 4, pixels.data(),
+                            int(extent_.width * 4));
+    }
+    if (!ok) throw std::runtime_error("could not write " + path);
 }

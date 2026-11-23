@@ -6,6 +6,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -15,67 +16,118 @@ struct Camera {
     float pitch = 0.0f;  // radians
     float fovY = 39.0f;  // degrees
 
-    glm::vec3 forward() const;
-    void lookAt(glm::vec3 target);
+    struct Basis {
+        glm::vec3 forward;
+        glm::vec3 right;
+        glm::vec3 up;
+    };
+
+    glm::vec3 forward() const noexcept;
+    Basis basis() const noexcept;
+    void lookAt(glm::vec3 target) noexcept;
+
+    bool operator==(const Camera&) const = default;
 };
 
-/// Owns the scene on the GPU, the ray-tracing and post-processing pipelines and every image they
-/// touch. One call to record() traces one frame of samples, then denoises and tonemaps into `ldr`.
+/// Owns the scene on the GPU, the ray-tracing and post-processing pipelines, and all render targets.
 class Renderer {
 public:
-    Renderer(Context& ctx, const Scene& scene, const Options& options);
+    Renderer(const Context& ctx, const Scene& scene, const Options& options);
 
-    void record(vk::CommandBuffer cmd);
-    /// Re-runs only denoise + tonemap (after changing `denoise` or `exposure`), blocking.
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+
+    /// Records a single ray-tracing pass of `spp` samples (0 = use samplesPerFrame).
+    void recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp = 0);
+
+    /// Records denoise (if enabled) + tonemap into the LDR target.
+    void recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps = false);
+
+    /// Interactive convenience: records trace + barrier + post in one command buffer.
+    void recordFrame(const vk::raii::CommandBuffer& cmd);
+
+    /// Runs denoise + tonemap in a blocking one-shot submission and updates postMs.
     void postProcess();
-    void reset() { frame = 0; }
-    /// After the frame's command buffer has completed: read GPU timings and advance the frame count.
+
+    /// Reads GPU timestamps after command completion and advances sample counts.
+    void finishTrace();
     void finishFrame();
 
-    std::vector<uint8_t> readLdr();  // RGBA8, blocking
-    void savePng(const std::string& path);
+    /// Recreates resolution-dependent render targets and resets accumulation.
+    void resize(vk::Extent2D newExtent);
 
-    Camera camera;
-    bool denoise = true;
-    float exposure = 1.0f;
-    uint32_t frame = 0;  // frames accumulated
-    uint32_t samplesPerFrame = 4;
-    uint32_t maxDepth = 8;
-    double traceMs = 0.0, postMs = 0.0;  // GPU time of the last frame
+    void reset() noexcept {
+        accumulatedSamples_ = 0;
+        frameIndex_ = 0;
+    }
 
-    uint32_t samples() const { return frame * samplesPerFrame; }
-    vk::Extent2D extent() const { return extent_; }
-    Image ldr;
+    const Camera& camera() const noexcept { return camera_; }
+    void setCamera(const Camera& cam) noexcept {
+        if (cam != camera_) {
+            camera_ = cam;
+            reset();
+        }
+    }
+
+    bool denoise() const noexcept { return denoise_; }
+    void setDenoise(bool enabled) noexcept { denoise_ = enabled; }
+    float exposure() const noexcept { return exposure_; }
+    void setExposure(float value) noexcept { exposure_ = value; }
+    uint32_t samplesPerFrame() const noexcept { return samplesPerFrame_; }
+    uint32_t samples() const noexcept { return accumulatedSamples_; }
+    vk::Extent2D extent() const noexcept { return extent_; }
+    vk::Image ldrImage() const noexcept { return ldr_.handle(); }
+
+    double traceMs() const noexcept { return traceMs_; }
+    double postMs() const noexcept { return postMs_; }
+
+    /// Writes PNG, JPG, or linear float32 HDR (selected by file extension).
+    void saveImage(const std::string& path) const;
 
 private:
-    void recordPost(vk::CommandBuffer cmd);
-    void createImages();
-    void createSceneBuffers(const Scene& scene);
+    void createImages(UploadBatch& batch);
+    void createSceneBuffers(UploadBatch& batch, const Scene& scene);
     void createRayTracingPipeline();
     void createPostPipelines();
     void createShaderBindingTable();
-    void writeDescriptors();
+    void createDescriptors();
+    void updateRtImageDescriptors();
 
-    Context& ctx;
+    std::vector<uint8_t> readLdr() const;
+    std::vector<float> readHdrRgb() const;
+
+    const Context& ctx_;
     vk::Extent2D extent_;
-    uint32_t lightCount = 0;
-    float lightArea = 0.0f;
-    float sceneScale = 1.0f;
+    Camera camera_;
+    bool denoise_ = true;
+    float exposure_ = 1.0f;
+    float clampLuminance_ = 64.0f;
+    uint32_t maxDepth_ = 8;
+    uint32_t samplesPerFrame_ = 4;
+    uint32_t accumulatedSamples_ = 0;
+    uint32_t pendingSpp_ = 0;
+    uint32_t frameIndex_ = 0;
+    uint32_t lightCount_ = 0;
+    float lightArea_ = 0.0f;
+    double traceMs_ = 0.0;
+    double postMs_ = 0.0;
 
-    Buffer vertexBuffer, indexBuffer, materialBuffer, materialIdBuffer, lightBuffer, instanceBuffer;
-    Accel blas, tlas;
-    Image accum, pingA, pingB, albedo, normalDepth;
+    Buffer vertexBuffer_, indexBuffer_, materialBuffer_, materialIdBuffer_, lightBuffer_, instanceBuffer_;
+    Accel blas_, tlas_;
+    Image accum_, pingA_, pingB_, albedo_, normalDepth_, ldr_;
 
-    vk::UniqueDescriptorPool descriptorPool;
-    vk::UniqueDescriptorSetLayout rtSetLayout, postSetLayout;
-    vk::UniqueDescriptorSet rtSet;
-    std::vector<vk::UniqueDescriptorSet> postSets;  // 0: accum->A, 1: A->B, 2: B->A
-    vk::UniquePipelineLayout rtLayout, postLayout;
-    vk::UniquePipeline rtPipeline, atrousPipeline, tonemapPipeline;
+    vk::raii::DescriptorPool descriptorPool_ = nullptr;
+    vk::raii::DescriptorSetLayout rtSetLayout_ = nullptr;
+    vk::raii::DescriptorSetLayout postSetLayout_ = nullptr;
+    vk::raii::DescriptorSet rtSet_ = nullptr;
+    vk::raii::PipelineLayout rtLayout_ = nullptr;
+    vk::raii::PipelineLayout postLayout_ = nullptr;
+    vk::raii::Pipeline rtPipeline_ = nullptr;
+    vk::raii::Pipeline atrousPipeline_ = nullptr;
+    vk::raii::Pipeline tonemapPipeline_ = nullptr;
 
-    Buffer sbt;
-    vk::StridedDeviceAddressRegionKHR raygenRegion, missRegion, hitRegion, callableRegion;
+    Buffer sbt_;
+    vk::StridedDeviceAddressRegionKHR raygenRegion_{}, missRegion_{}, hitRegion_{}, callableRegion_{};
 
-    vk::UniqueQueryPool timestamps;
-    bool timestampsWritten = false;
+    vk::raii::QueryPool timestamps_ = nullptr;
 };

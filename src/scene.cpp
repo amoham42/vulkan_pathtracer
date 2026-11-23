@@ -3,23 +3,35 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
 
+#include <glm/gtx/hash.hpp>
+
 #include <algorithm>
 #include <filesystem>
-#include <iostream>
 #include <limits>
+#include <print>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
 
 namespace {
 
-glm::vec3 rgb(const tinyobj::real_t* c) { return {c[0], c[1], c[2]}; }
-float maxComponent(glm::vec3 v) { return std::max(v.x, std::max(v.y, v.z)); }
+glm::vec3 rgb(const tinyobj::real_t* c) noexcept { return {c[0], c[1], c[2]}; }
+float maxComponent(glm::vec3 v) noexcept { return std::max({v.x, v.y, v.z}); }
+
+struct VertexHash {
+    size_t operator()(const GpuVertex& v) const noexcept {
+        const size_t h1 = std::hash<glm::vec4>{}(v.position);
+        const size_t h2 = std::hash<glm::vec4>{}(v.normal);
+        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
 
 // MTL -> one of four BSDFs. `illum` follows the MTL spec: 5 = mirror, 7 = refraction (glass),
 // 3 = ray-traced reflection, which with a finite Ns we read as a glossy Phong lobe.
 GpuMaterial convert(const tinyobj::material_t& m) {
     glm::vec3 kd = rgb(m.diffuse), ks = rgb(m.specular), ke = rgb(m.emission);
-    float ns = std::max(1.0f, static_cast<float>(m.shininess));
-    float ior = m.ior > 1.0f ? static_cast<float>(m.ior) : 1.5f;
+    const float ns = std::max(1.0f, static_cast<float>(m.shininess));
+    const float ior = m.ior > 1.0f ? static_cast<float>(m.ior) : 1.5f;
 
     MaterialType type = MaterialType::Diffuse;
     if (m.illum == 5) {
@@ -31,7 +43,7 @@ GpuMaterial convert(const tinyobj::material_t& m) {
         type = ns >= 2000.0f ? MaterialType::Mirror : MaterialType::Glossy;
     }
 
-    // keep a glossy surface energy-conserving: diffuse + specular can't reflect more than came in
+    // Keep glossy surfaces energy-conserving: diffuse + specular cannot reflect more than came in.
     if (type == MaterialType::Glossy) {
         const float total = maxComponent(kd + ks);
         if (total > 0.99f) {
@@ -39,7 +51,7 @@ GpuMaterial convert(const tinyobj::material_t& m) {
             ks *= 0.99f / total;
         }
     }
-    return {glm::vec4(kd, static_cast<float>(type)), glm::vec4(ks, ns), glm::vec4(ke, ior)};
+    return {glm::vec4(kd, static_cast<float>(std::to_underlying(type))), glm::vec4(ks, ns), glm::vec4(ke, ior)};
 }
 
 }  // namespace
@@ -51,21 +63,25 @@ Scene loadObj(const std::string& path) {
     config.triangulate = true;
 
     tinyobj::ObjReader reader;
-    if (!reader.ParseFromFile(path, config)) throw std::runtime_error("could not load " + path + ": " + reader.Error());
-    if (!reader.Warning().empty()) std::cerr << "[obj] " << reader.Warning();
+    if (!reader.ParseFromFile(path, config))
+        throw std::runtime_error("could not load " + path + ": " + reader.Error());
+    if (!reader.Warning().empty()) std::print(stderr, "[obj] {}", reader.Warning());
 
     const auto& attrib = reader.GetAttrib();
     const auto& shapes = reader.GetShapes();
     const auto& materials = reader.GetMaterials();
 
     Scene scene;
+    scene.materials.reserve(materials.size() + 1);
     for (const auto& m : materials) scene.materials.push_back(convert(m));
     const auto fallback = static_cast<uint32_t>(scene.materials.size());
-    scene.materials.push_back({glm::vec4(0.7f, 0.7f, 0.7f, 0.0f), glm::vec4(0.0f, 0.0f, 0.0f, 1.0f), glm::vec4(0.0f, 0.0f, 0.0f, 1.5f)});
+    scene.materials.push_back({glm::vec4(0.7f, 0.7f, 0.7f, 0.0f), glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                               glm::vec4(0.0f, 0.0f, 0.0f, 1.5f)});
 
     scene.boundsMin = glm::vec3(std::numeric_limits<float>::max());
     scene.boundsMax = glm::vec3(std::numeric_limits<float>::lowest());
 
+    std::unordered_map<GpuVertex, uint32_t, VertexHash> uniqueVertices;
     for (const auto& shape : shapes) {
         const auto& mesh = shape.mesh;
         for (size_t f = 0; f < mesh.num_face_vertices.size(); f++) {
@@ -78,18 +94,22 @@ Scene loadObj(const std::string& path) {
                     v.normal = glm::vec4(attrib.normals[3 * idx.normal_index + 0], attrib.normals[3 * idx.normal_index + 1],
                                          attrib.normals[3 * idx.normal_index + 2], 1.0f);
                 }
-                scene.boundsMin = glm::min(scene.boundsMin, glm::vec3(v.position));
-                scene.boundsMax = glm::max(scene.boundsMax, glm::vec3(v.position));
-                scene.indices.push_back(static_cast<uint32_t>(scene.vertices.size()));
-                scene.vertices.push_back(v);
+                const auto [it, inserted] = uniqueVertices.emplace(v, static_cast<uint32_t>(scene.vertices.size()));
+                if (inserted) {
+                    scene.boundsMin = glm::min(scene.boundsMin, glm::vec3(v.position));
+                    scene.boundsMax = glm::max(scene.boundsMax, glm::vec3(v.position));
+                    scene.vertices.push_back(v);
+                }
+                scene.indices.push_back(it->second);
             }
             const int mat = f < mesh.material_ids.size() ? mesh.material_ids[f] : -1;
-            scene.materialIds.push_back(mat >= 0 && mat < static_cast<int>(materials.size()) ? static_cast<uint32_t>(mat) : fallback);
+            scene.materialIds.push_back(mat >= 0 && mat < static_cast<int>(materials.size()) ? static_cast<uint32_t>(mat)
+                                                                                             : fallback);
         }
     }
     if (scene.indices.empty()) throw std::runtime_error(path + " has no triangles");
 
-    // every emissive triangle is a light, picked in proportion to its area
+    // Every emissive triangle is an area light, sampled in proportion to its area.
     for (uint32_t t = 0; t < scene.triangleCount(); t++) {
         if (maxComponent(glm::vec3(scene.materials[scene.materialIds[t]].emission)) <= 0.0f) continue;
         const glm::vec3 a(scene.vertices[scene.indices[3 * t + 0]].position);
@@ -100,6 +120,7 @@ Scene loadObj(const std::string& path) {
         scene.lightArea += area;
         scene.lights.push_back({t, scene.lightArea});
     }
-    if (scene.lights.empty()) std::cerr << "[obj] warning: " << path << " has no emissive (Ke) materials; the image will be black\n";
+    if (scene.lights.empty())
+        std::println(stderr, "[obj] warning: {} has no emissive (Ke) materials; the image will be black", path);
     return scene;
 }
