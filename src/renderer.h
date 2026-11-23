@@ -114,7 +114,7 @@ private:
     double traceMs_ = 0.0;
     double postMs_ = 0.0;
 
-    Buffer vertexBuffer_, indexBuffer_, materialBuffer_, materialIdBuffer_, lightBuffer_, instanceBuffer_;
+    Buffer vertexBuffer_, normalBuffer_, indexBuffer_, materialBuffer_, materialIdBuffer_, lightBuffer_, instanceBuffer_;
     Accel blas_, tlas_;
     Image accum_, pingA_, pingB_, albedo_, normalDepth_, ldr_;
 
@@ -125,8 +125,10 @@ private:
     vk::raii::PipelineLayout rtLayout_ = nullptr;
     vk::raii::PipelineLayout postLayout_ = nullptr;
     vk::raii::Pipeline rtPipeline_ = nullptr;
+    vk::raii::Pipeline atrousPass0Pipeline_ = nullptr;
     vk::raii::Pipeline atrousPipeline_ = nullptr;
     vk::raii::Pipeline tonemapPipeline_ = nullptr;
+    vk::raii::Pipeline tonemapFp16Pipeline_ = nullptr;
 
     Buffer sbt_;
     vk::StridedDeviceAddressRegionKHR raygenRegion_{}, missRegion_{}, hitRegion_{}, callableRegion_{};

@@ -51,18 +51,23 @@ set(SHADER_SOURCES
 )
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SPIRV_FILES)
-foreach (SRC ${SHADER_SOURCES})
-    get_filename_component(NAME ${SRC} NAME)
-    set(OUT ${SHADER_OUT_DIR}/${NAME}.spv)
+function(add_shader_variant SRC OUT_NAME)
+    set(OUT ${SHADER_OUT_DIR}/${OUT_NAME}.spv)
     add_custom_command(
         OUTPUT ${OUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT_DIR}
-        COMMAND Vulkan::glslc --target-env=${VPT_GLSLC_TARGET_ENV} -O -o ${OUT} ${CMAKE_SOURCE_DIR}/${SRC}
+        COMMAND Vulkan::glslc --target-env=${VPT_GLSLC_TARGET_ENV} -O ${ARGN} -o ${OUT} ${CMAKE_SOURCE_DIR}/${SRC}
         DEPENDS ${CMAKE_SOURCE_DIR}/${SRC} ${CMAKE_SOURCE_DIR}/assets/shaders/common.glsl
-        COMMENT "glslc ${NAME}"
+        COMMENT "glslc ${OUT_NAME}"
         VERBATIM)
-    list(APPEND SPIRV_FILES ${OUT})
+    set(SPIRV_FILES ${SPIRV_FILES} ${OUT} PARENT_SCOPE)
+endfunction()
+foreach (SRC ${SHADER_SOURCES})
+    get_filename_component(NAME ${SRC} NAME)
+    add_shader_variant(${SRC} ${NAME})
 endforeach ()
+add_shader_variant(assets/shaders/atrous.comp atrous_p0.comp -DPASS0=1)
+add_shader_variant(assets/shaders/tonemap.comp tonemap_fp16.comp -DSRC_FP16=1)
 add_custom_target(shaders DEPENDS ${SPIRV_FILES})
 
 # ---- tracer ----

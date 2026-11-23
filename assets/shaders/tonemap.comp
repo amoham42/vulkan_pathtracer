@@ -4,13 +4,17 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0, rgba32f) uniform readonly image2D src;
+#ifdef SRC_FP16
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
 layout(set = 0, binding = 2, rgba16f) uniform readonly image2D albedoImage;
+#else
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D src;
+#endif
 layout(set = 0, binding = 4, rgba8) uniform writeonly image2D ldrImage;
 
 layout(push_constant) uniform Post {
     int stepWidth;
-    int demodulate;  // 1: src holds lighting only (denoised); multiply the albedo back in
+    int demodulate;
     float sigmaColor;
     float normalPower;
     float sigmaDepth;
@@ -31,6 +35,8 @@ void main() {
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(p, imageSize(src)))) return;
     vec3 c = imageLoad(src, p).rgb;
-    if (pc.demodulate == 1) c *= max(imageLoad(albedoImage, p).rgb, vec3(1e-3));
+#ifdef SRC_FP16
+    c *= max(imageLoad(albedoImage, p).rgb, vec3(1e-3));
+#endif
     imageStore(ldrImage, p, vec4(linearToSrgb(aces(c * pc.exposure)), 1.0));
 }
