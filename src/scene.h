@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-// Layouts shared with shaders/common.glsl. Keep them in sync.
+// Layouts shared with assets/shaders/common.glsl. Keep them in sync.
 
 struct GpuVertex {
     glm::vec4 position;  // xyz

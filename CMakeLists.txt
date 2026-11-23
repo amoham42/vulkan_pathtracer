@@ -16,12 +16,12 @@ add_subdirectory(external/glfw)
 
 # ---- shaders: GLSL -> SPIR-V at build time, next to the executable ----
 set(SHADER_SOURCES
-    shaders/raygen.rgen
-    shaders/closesthit.rchit
-    shaders/miss.rmiss
-    shaders/shadow.rmiss
-    shaders/atrous.comp
-    shaders/tonemap.comp
+    assets/shaders/raygen.rgen
+    assets/shaders/closesthit.rchit
+    assets/shaders/miss.rmiss
+    assets/shaders/shadow.rmiss
+    assets/shaders/atrous.comp
+    assets/shaders/tonemap.comp
 )
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SPIRV_FILES)
@@ -32,7 +32,7 @@ foreach (SRC ${SHADER_SOURCES})
         OUTPUT ${OUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT_DIR}
         COMMAND Vulkan::glslc --target-env=vulkan1.3 -O -o ${OUT} ${CMAKE_SOURCE_DIR}/${SRC}
-        DEPENDS ${CMAKE_SOURCE_DIR}/${SRC} ${CMAKE_SOURCE_DIR}/shaders/common.glsl
+        DEPENDS ${CMAKE_SOURCE_DIR}/${SRC} ${CMAKE_SOURCE_DIR}/assets/shaders/common.glsl
         COMMENT "glslc ${NAME}"
         VERBATIM)
     list(APPEND SPIRV_FILES ${OUT})

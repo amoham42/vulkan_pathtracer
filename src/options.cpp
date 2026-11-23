@@ -88,7 +88,7 @@ Options parseOptions(int argc, char** argv) {
             usage(1);
         } else o.scene = a;
     }
-    if (o.scene.empty()) o.scene = std::string(VPT_ASSET_DIR) + "/CornellBox/CornellBox-Sphere.obj";
+    if (o.scene.empty()) o.scene = std::string(VPT_ASSET_DIR) + "/models/CornellBox/CornellBox-Sphere.obj";
     if (o.headless && o.targetSpp == 0) o.targetSpp = 1024;
     return o;
 }

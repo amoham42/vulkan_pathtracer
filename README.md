@@ -7,7 +7,7 @@
 
 A physically based path tracer built on Vulkan's hardware ray-tracing pipeline (`VK_KHR_ray_tracing_pipeline`). It renders progressively in a window at interactive rates, with an edge-aware wavelet denoiser running on the GPU, or offscreen to a PNG.
 
-![Cornell box with a mirror sphere and a glass sphere](docs/images/sphere.jpg)
+![Cornell box with a mirror sphere and a glass sphere](assets/renders/sphere.jpg)
 
 *1024×1024, 2048 samples per pixel, 4.8 s on a laptop RTX 3070. The caustic under the glass sphere comes from the light paths themselves; nothing is faked.*
 
@@ -23,7 +23,7 @@ A physically based path tracer built on Vulkan's hardware ray-tracing pipeline (
 
 ## Denoiser
 
-![8 samples per pixel, raw vs denoised](docs/images/denoise.jpg)
+![8 samples per pixel, raw vs denoised](assets/renders/denoise.jpg)
 
 At 8 samples per pixel the raw image is mostly noise. Five À-Trous passes cover an 81×81 pixel footprint for about 3 ms at 1024². The normal and depth weights keep geometric edges, and the variance-scaled colour weight keeps shadow boundaries.
 
@@ -31,9 +31,9 @@ At 8 samples per pixel the raw image is mostly noise. Five À-Trous passes cover
 
 | | |
 |:-:|:-:|
-| ![](docs/images/glossy.jpg) | ![](docs/images/original.jpg) |
+| ![](assets/renders/glossy.jpg) | ![](assets/renders/original.jpg) |
 | Glossy sphere and box (Phong lobes) | The original Cornell box |
-| ![](docs/images/mirror.jpg) | ![](docs/images/sphere.jpg) |
+| ![](assets/renders/mirror.jpg) | ![](assets/renders/sphere.jpg) |
 | Mirror box | Mirror and glass spheres |
 
 All at 1024², 2048 spp, denoised, rendered with `--headless`.
@@ -68,10 +68,10 @@ That is roughly 350–550 million camera paths per second. Each path makes up to
 
 | File | Purpose |
 |---|---|
-| `shaders/raygen.rgen` | the path tracer: camera rays, BSDF sampling, light sampling, MIS, accumulation |
-| `shaders/closesthit.rchit` | fetches the triangle, interpolates the normal, works out which side was hit |
-| `shaders/miss.rmiss`, `shadow.rmiss` | escaped path / visible light |
-| `shaders/atrous.comp`, `tonemap.comp` | denoiser pass, display transform |
+| `assets/shaders/raygen.rgen` | the path tracer: camera rays, BSDF sampling, light sampling, MIS, accumulation |
+| `assets/shaders/closesthit.rchit` | fetches the triangle, interpolates the normal, works out which side was hit |
+| `assets/shaders/miss.rmiss`, `shadow.rmiss` | escaped path / visible light |
+| `assets/shaders/atrous.comp`, `tonemap.comp` | denoiser pass, display transform |
 | `src/renderer.cpp` | acceleration structures, pipelines, shader binding table, per-frame commands |
 | `src/scene.cpp` | OBJ/MTL loading, material classification, the emissive-triangle list |
 | `src/context.cpp` | instance and device; picks a GPU that can actually ray trace |
@@ -96,10 +96,10 @@ On Linux, GLFW needs the X11 and Wayland development packages (on Debian/Ubuntu:
 ./build/vulkan-tracer
 
 # any OBJ with emissive (Ke) materials
-./build/vulkan-tracer assets/CornellBox/CornellBox-Glossy.obj
+./build/vulkan-tracer assets/models/CornellBox/CornellBox-Glossy.obj
 
 # offscreen: 1024 spp to a PNG, plus the raw image for comparison
-./build/vulkan-tracer assets/CornellBox/CornellBox-Sphere.obj --headless --spp 1024 --compare --out sphere.png
+./build/vulkan-tracer assets/models/CornellBox/CornellBox-Sphere.obj --headless --spp 1024 --compare --out sphere.png
 ```
 
 | Key | Action |
@@ -130,4 +130,4 @@ Run `--help` for all options: resolution, samples, path depth, camera position a
 
 ## License
 
-The code in this repository is released under the [MIT License](LICENSE). Vendored libraries in `external/` keep their own licenses: [GLFW](external/glfw/LICENSE.md) (zlib), [GLM](external/glm/copying.txt) (MIT / Happy Bunny), [tinyobjloader](external/tinyobjloader/LICENSE) (MIT) and stb_image_write (MIT / public domain). The Cornell box models in `assets/CornellBox` are CC BY 3.0 ([details](assets/CornellBox/copyright.txt)).
+The code in this repository is released under the [MIT License](LICENSE). Vendored libraries in `external/` keep their own licenses: [GLFW](external/glfw/LICENSE.md) (zlib), [GLM](external/glm/copying.txt) (MIT / Happy Bunny), [tinyobjloader](external/tinyobjloader/LICENSE) (MIT) and stb_image_write (MIT / public domain). The Cornell box models in `assets/models/CornellBox` are CC BY 3.0 ([details](assets/models/CornellBox/copyright.txt)).
