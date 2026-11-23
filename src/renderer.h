@@ -38,10 +38,11 @@ public:
     Renderer& operator=(const Renderer&) = delete;
 
     /// Records a single ray-tracing pass of `spp` samples (0 = use samplesPerFrame).
-    void recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp = 0);
+    /// `slot` selects timestamp query bank (0 or 1) for double-buffered submissions.
+    void recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp = 0, uint32_t slot = 0);
 
     /// Records denoise (if enabled) + tonemap into the LDR target.
-    void recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps = false);
+    void recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps = false, uint32_t slot = 0);
 
     /// Interactive convenience: records trace + barrier + post in one command buffer.
     void recordFrame(const vk::raii::CommandBuffer& cmd);
@@ -49,9 +50,9 @@ public:
     /// Runs denoise + tonemap in a blocking one-shot submission and updates postMs.
     void postProcess();
 
-    /// Reads GPU timestamps after command completion and advances sample counts.
-    void finishTrace();
-    void finishFrame();
+    /// Reads GPU timestamps for `slot` after command completion.
+    void finishTrace(uint32_t slot = 0);
+    void finishFrame(uint32_t slot = 0);
 
     /// Recreates resolution-dependent render targets and resets accumulation.
     void resize(vk::Extent2D newExtent);
@@ -73,6 +74,7 @@ public:
     void setDenoise(bool enabled) noexcept { denoise_ = enabled; }
     float exposure() const noexcept { return exposure_; }
     void setExposure(float value) noexcept { exposure_ = value; }
+    bool usingRayQuery() const noexcept { return useRayQuery_; }
     uint32_t samplesPerFrame() const noexcept { return samplesPerFrame_; }
     uint32_t samples() const noexcept { return accumulatedSamples_; }
     vk::Extent2D extent() const noexcept { return extent_; }
@@ -87,7 +89,7 @@ public:
 private:
     void createImages(UploadBatch& batch);
     void createSceneBuffers(UploadBatch& batch, const Scene& scene);
-    void createRayTracingPipeline();
+    void createTracePipeline();
     void createPostPipelines();
     void createShaderBindingTable();
     void createDescriptors();
@@ -99,13 +101,13 @@ private:
     const Context& ctx_;
     vk::Extent2D extent_;
     Camera camera_;
+    bool useRayQuery_ = false;
     bool denoise_ = true;
     float exposure_ = 1.0f;
     float clampLuminance_ = 64.0f;
     uint32_t maxDepth_ = 8;
     uint32_t samplesPerFrame_ = 4;
     uint32_t accumulatedSamples_ = 0;
-    uint32_t pendingSpp_ = 0;
     uint32_t frameIndex_ = 0;
     uint32_t lightCount_ = 0;
     float lightArea_ = 0.0f;

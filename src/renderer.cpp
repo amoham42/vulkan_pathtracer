@@ -111,11 +111,17 @@ void Camera::lookAt(glm::vec3 target) noexcept {
 Renderer::Renderer(const Context& context, const Scene& scene, const Options& o)
     : ctx_(context),
       extent_{o.width, o.height},
+      useRayQuery_(o.backend == TraceBackend::RayQuery ? true
+                   : o.backend == TraceBackend::RayPipeline ? false
+                   : context.hasRayQuery),
       denoise_(o.denoise),
       exposure_(o.exposure),
       clampLuminance_(o.clampLuminance.value_or(o.denoise ? 64.0f : 0.0f)),
       maxDepth_(o.maxDepth),
       samplesPerFrame_(o.samplesPerFrame) {
+    if (useRayQuery_ && !ctx_.hasRayQuery)
+        throw std::runtime_error("--backend rq requested, but this GPU does not support VK_KHR_ray_query");
+
     // Frame the scene unless told where to stand.
     const glm::vec3 lo = scene.boundsMin, hi = scene.boundsMax, center = 0.5f * (lo + hi), size = hi - lo;
     camera_.fovY = o.fov;
@@ -135,11 +141,12 @@ Renderer::Renderer(const Context& context, const Scene& scene, const Options& o)
     createSceneBuffers(batch, scene);
     batch.flush();
 
-    createRayTracingPipeline();
+    createTracePipeline();
     createPostPipelines();
-    createShaderBindingTable();
+    if (!useRayQuery_) createShaderBindingTable();
     createDescriptors();
-    timestamps_ = ctx_.device.createQueryPool({{}, vk::QueryType::eTimestamp, 3});
+    // Two banks of 3 timestamps (slots 0 and 1) for double-buffered GPU submissions.
+    timestamps_ = ctx_.device.createQueryPool({{}, vk::QueryType::eTimestamp, 6});
 }
 
 void Renderer::createImages(UploadBatch& batch) {
@@ -159,7 +166,7 @@ void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
     indexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const uint32_t>(scene.indices));
     materialBuffer_ = batch.createBuffer(K::Storage, std::span<const GpuMaterial>(scene.materials));
     materialIdBuffer_ = batch.createBuffer(K::Storage, std::span<const uint32_t>(scene.materialIds));
-    const std::array<GpuLight, 1> fallbackLight{{{0, 0.0f}}};
+    const std::array<GpuLight, 1> fallbackLight{{}};
     lightBuffer_ = scene.lights.empty() ? batch.createBuffer(K::Storage, std::span<const GpuLight>(fallbackLight))
                                         : batch.createBuffer(K::Storage, std::span<const GpuLight>(scene.lights));
     lightCount_ = static_cast<uint32_t>(scene.lights.size());
@@ -199,7 +206,37 @@ void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
     tlas_ = batch.buildAccel(tlasGeometry, 1, vk::AccelerationStructureTypeKHR::eTopLevel);
 }
 
-void Renderer::createRayTracingPipeline() {
+void Renderer::createTracePipeline() {
+    if (useRayQuery_) {
+        const auto comp = Stage::eCompute;
+        const std::array<vk::DescriptorSetLayoutBinding, 9> bindings{{
+            {0, DT::eAccelerationStructureKHR, 1, comp},
+            {1, DT::eStorageImage, 1, comp},
+            {2, DT::eStorageBuffer, 1, comp},
+            {3, DT::eStorageBuffer, 1, comp},
+            {4, DT::eStorageBuffer, 1, comp},
+            {5, DT::eStorageBuffer, 1, comp},
+            {6, DT::eStorageBuffer, 1, comp},
+            {7, DT::eStorageImage, 1, comp},
+            {8, DT::eStorageImage, 1, comp},
+        }};
+        rtSetLayout_ = ctx_.device.createDescriptorSetLayout({{}, bindings});
+        const vk::PushConstantRange push(comp, 0, sizeof(FramePush));
+        rtLayout_ = ctx_.device.createPipelineLayout({{}, *rtSetLayout_, push});
+
+        const auto code = readSpirv("pathtrace.comp");
+        if (ctx_.hasMaintenance5) {
+            const vk::ShaderModuleCreateInfo modInfo({}, code);
+            const auto stage = vk::PipelineShaderStageCreateInfo({}, comp, {}, "main").setPNext(&modInfo);
+            rtPipeline_ = ctx_.device.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo({}, stage, *rtLayout_));
+        } else {
+            const auto mod = ctx_.device.createShaderModule({{}, code});
+            const vk::PipelineShaderStageCreateInfo stage({}, comp, *mod, "main");
+            rtPipeline_ = ctx_.device.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo({}, stage, *rtLayout_));
+        }
+        return;
+    }
+
     const auto rgen = Stage::eRaygenKHR, chit = Stage::eClosestHitKHR;
     const std::array<vk::DescriptorSetLayoutBinding, 9> bindings{{
         {0, DT::eAccelerationStructureKHR, 1, rgen},  // TLAS
@@ -233,7 +270,6 @@ void Renderer::createRayTracingPipeline() {
     }};
 
     if (ctx_.hasMaintenance5) {
-        // Vulkan 1.4-promoted maintenance5: inline ShaderModuleCreateInfo without temporary VkShaderModule objects.
         std::array<vk::ShaderModuleCreateInfo, 4> modInfos;
         std::array<vk::PipelineShaderStageCreateInfo, 4> stages;
         for (size_t i = 0; i < 4; i++) {
@@ -366,10 +402,11 @@ void Renderer::resize(vk::Extent2D newExtent) {
     reset();
 }
 
-void Renderer::recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp) {
-    pendingSpp_ = spp > 0 ? spp : samplesPerFrame_;
-    cmd.resetQueryPool(*timestamps_, 0, 3);
-    cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, 0);
+void Renderer::recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp, uint32_t slot) {
+    const uint32_t launchSpp = spp > 0 ? spp : samplesPerFrame_;
+    const uint32_t qBase = (slot & 1u) * 3u;
+    cmd.resetQueryPool(*timestamps_, qBase, 3);
+    cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, qBase + 0);
 
     const auto [f, r, u] = camera_.basis();
     const FramePush push{
@@ -378,7 +415,7 @@ void Renderer::recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp) {
         .up = glm::vec4(u, 0.0f),
         .forward = glm::vec4(f, 0.0f),
         .prevSamples = accumulatedSamples_,
-        .spp = pendingSpp_,
+        .spp = launchSpp,
         .maxDepth = maxDepth_,
         .lightCount = lightCount_,
         .lightArea = lightArea_,
@@ -387,17 +424,33 @@ void Renderer::recordTrace(const vk::raii::CommandBuffer& cmd, uint32_t spp) {
         .frameIndex = frameIndex_,
     };
 
-    memoryBarrier(cmd, PS::eRayTracingShaderKHR | PS::eComputeShader | PS::eTransfer,
-                  A::eShaderStorageWrite | A::eShaderStorageRead | A::eTransferRead, PS::eRayTracingShaderKHR,
-                  A::eShaderStorageWrite | A::eShaderStorageRead);
-    cmd.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline_);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtLayout_, 0, *rtSet_, nullptr);
-    cmd.pushConstants<FramePush>(*rtLayout_, Stage::eRaygenKHR, 0, push);
-    cmd.traceRaysKHR(raygenRegion_, missRegion_, hitRegion_, callableRegion_, extent_.width, extent_.height, 1);
-    cmd.writeTimestamp2(PS::eRayTracingShaderKHR, *timestamps_, 1);
+    accumulatedSamples_ += launchSpp;
+    frameIndex_++;
+
+    {
+        const ScopedGpuLabel label(ctx_, cmd, useRayQuery_ ? "PathTrace (RayQuery)" : "PathTrace (RTPipeline)",
+                                   {0.2f, 0.8f, 0.3f, 1.0f});
+        const auto traceStage = useRayQuery_ ? PS::eComputeShader : PS::eRayTracingShaderKHR;
+        memoryBarrier(cmd, PS::eRayTracingShaderKHR | PS::eComputeShader | PS::eTransfer,
+                      A::eShaderStorageWrite | A::eShaderStorageRead | A::eTransferRead, traceStage,
+                      A::eShaderStorageWrite | A::eShaderStorageRead);
+        if (useRayQuery_) {
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *rtPipeline_);
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *rtLayout_, 0, *rtSet_, nullptr);
+            cmd.pushConstants<FramePush>(*rtLayout_, Stage::eCompute, 0, push);
+            cmd.dispatch((extent_.width + 7) / 8, (extent_.height + 7) / 8, 1);
+        } else {
+            cmd.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline_);
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtLayout_, 0, *rtSet_, nullptr);
+            cmd.pushConstants<FramePush>(*rtLayout_, Stage::eRaygenKHR, 0, push);
+            cmd.traceRaysKHR(raygenRegion_, missRegion_, hitRegion_, callableRegion_, extent_.width, extent_.height, 1);
+        }
+    }
+    cmd.writeTimestamp2(useRayQuery_ ? PS::eComputeShader : PS::eRayTracingShaderKHR, *timestamps_, qBase + 1);
 }
 
-void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps) {
+void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestamps, uint32_t slot) {
+    const uint32_t qBase = (slot & 1u) * 3u;
     const uint32_t gx = (extent_.width + 15) / 16, gy = (extent_.height + 15) / 16;
     const auto albInfo = albedo_.descriptor();
     const auto ndInfo = normalDepth_.descriptor();
@@ -417,8 +470,8 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
     };
 
     if (writeTimestamps) {
-        cmd.resetQueryPool(*timestamps_, 1, 2);
-        cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, 1);
+        cmd.resetQueryPool(*timestamps_, qBase + 1, 2);
+        cmd.writeTimestamp2(PS::eTopOfPipe, *timestamps_, qBase + 1);
     }
 
     PostPush post{
@@ -428,14 +481,13 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
         .normalPower = 64.0f,
         .sigmaDepth = 0.05f,
         .exposure = exposure_,
-        .totalSamples = std::max(1u, accumulatedSamples_ + pendingSpp_),
+        .totalSamples = std::max(1u, accumulatedSamples_),
         .pad = 0,
     };
 
     const Image* tonemapSrc = &accum_;
     if (denoise_) {
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPipeline_);
-        // 5 passes: accum->A, A->B, B->A, A->B, B->A (ends in A)
         const std::array<std::pair<const Image*, const Image*>, kAtrousPasses> passes{{
             {&accum_, &pingA_},
             {&pingA_, &pingB_},
@@ -443,7 +495,11 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
             {&pingA_, &pingB_},
             {&pingB_, &pingA_},
         }};
+        static constexpr std::array<const char*, kAtrousPasses> kPassNames{
+            "Atrous Pass 0 (step 1)", "Atrous Pass 1 (step 2)", "Atrous Pass 2 (step 4)", "Atrous Pass 3 (step 8)",
+            "Atrous Pass 4 (step 16)"};
         for (int pass = 0; pass < kAtrousPasses; pass++) {
+            const ScopedGpuLabel label(ctx_, cmd, kPassNames[pass], {0.9f, 0.6f, 0.1f, 1.0f});
             post.stepWidth = 1 << pass;
             post.demodulate = pass == 0 ? 1 : 0;
             pushBindings(*passes[pass].first, *passes[pass].second);
@@ -454,29 +510,32 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
         tonemapSrc = &pingA_;
     }
 
-    post.demodulate = denoise_ ? 1 : 0;
-    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *tonemapPipeline_);
-    pushBindings(*tonemapSrc, pingB_);
-    cmd.pushConstants<PostPush>(*postLayout_, Stage::eCompute, 0, post);
-    cmd.dispatch(gx, gy, 1);
-    memoryBarrier(cmd, PS::eComputeShader, A::eShaderStorageWrite, PS::eTransfer | PS::eComputeShader,
-                  A::eTransferRead | A::eShaderStorageRead);
+    {
+        const ScopedGpuLabel label(ctx_, cmd, "Tonemap", {0.7f, 0.3f, 0.9f, 1.0f});
+        post.demodulate = denoise_ ? 1 : 0;
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *tonemapPipeline_);
+        pushBindings(*tonemapSrc, pingB_);
+        cmd.pushConstants<PostPush>(*postLayout_, Stage::eCompute, 0, post);
+        cmd.dispatch(gx, gy, 1);
+        memoryBarrier(cmd, PS::eComputeShader, A::eShaderStorageWrite, PS::eTransfer | PS::eComputeShader,
+                      A::eTransferRead | A::eShaderStorageRead);
+    }
 
-    cmd.writeTimestamp2(PS::eComputeShader, *timestamps_, 2);
+    cmd.writeTimestamp2(PS::eComputeShader, *timestamps_, qBase + 2);
 }
 
 void Renderer::recordFrame(const vk::raii::CommandBuffer& cmd) {
-    recordTrace(cmd);
-    memoryBarrier(cmd, PS::eRayTracingShaderKHR, A::eShaderStorageWrite, PS::eComputeShader, A::eShaderStorageRead);
-    recordPost(cmd, false);
+    recordTrace(cmd, 0, 0);
+    memoryBarrier(cmd, useRayQuery_ ? PS::eComputeShader : PS::eRayTracingShaderKHR, A::eShaderStorageWrite,
+                  PS::eComputeShader, A::eShaderStorageRead);
+    recordPost(cmd, false, 0);
 }
 
 void Renderer::postProcess() {
-    pendingSpp_ = 0;
     ctx_.oneTimeSubmit([&](const vk::raii::CommandBuffer& cmd) {
         memoryBarrier(cmd, PS::eRayTracingShaderKHR | PS::eComputeShader, A::eShaderStorageWrite, PS::eComputeShader,
                       A::eShaderStorageRead);
-        recordPost(cmd, true);
+        recordPost(cmd, true, 0);
     });
     const auto [res, t] = timestamps_.getResults<uint64_t>(
         1, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
@@ -486,35 +545,32 @@ void Renderer::postProcess() {
     }
 }
 
-void Renderer::finishTrace() {
+void Renderer::finishTrace(uint32_t slot) {
+    const uint32_t qBase = (slot & 1u) * 3u;
     const auto [res, t] = timestamps_.getResults<uint64_t>(
-        0, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+        qBase, 2, 2 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
     if (res == vk::Result::eSuccess) {
         const double period = ctx_.properties.limits.timestampPeriod * 1e-6;
         traceMs_ = double(t[1] - t[0]) * period;
     }
-    accumulatedSamples_ += pendingSpp_;
-    pendingSpp_ = 0;
-    frameIndex_++;
 }
 
-void Renderer::finishFrame() {
+void Renderer::finishFrame(uint32_t slot) {
+    const uint32_t qBase = (slot & 1u) * 3u;
     const auto [res, t] = timestamps_.getResults<uint64_t>(
-        0, 3, 3 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+        qBase, 3, 3 * sizeof(uint64_t), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
     if (res == vk::Result::eSuccess) {
         const double period = ctx_.properties.limits.timestampPeriod * 1e-6;
         traceMs_ = double(t[1] - t[0]) * period;
         postMs_ = double(t[2] - t[1]) * period;
     }
-    accumulatedSamples_ += pendingSpp_;
-    pendingSpp_ = 0;
-    frameIndex_++;
 }
 
 std::vector<uint8_t> Renderer::readLdr() const {
     const vk::DeviceSize bytes = vk::DeviceSize(extent_.width) * extent_.height * 4;
     Buffer readback(ctx_, Buffer::Kind::Readback, bytes);
     ctx_.oneTimeSubmit([&](const vk::raii::CommandBuffer& cmd) {
+        const ScopedGpuLabel label(ctx_, cmd, "Readback LDR", {0.4f, 0.7f, 0.9f, 1.0f});
         const vk::BufferImageCopy region(0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0},
                                          {extent_.width, extent_.height, 1});
         cmd.copyImageToBuffer(ldr_.handle(), vk::ImageLayout::eGeneral, readback.handle(), region);

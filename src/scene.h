@@ -29,12 +29,19 @@ static_assert(sizeof(GpuMaterial) == 48);
 static_assert(offsetof(GpuMaterial, specular) == 16);
 static_assert(offsetof(GpuMaterial, emission) == 32);
 
+// Pre-unpacked emissive triangle so light sampling needs zero index/vertex/material pointer chasing.
 struct GpuLight {
-    uint32_t triangle;
-    float cdf;  // running sum of emitter area, for picking a light proportional to its area
+    glm::vec4 v0Cdf;      // xyz = vertex A, w = running area CDF
+    glm::vec4 e1;         // xyz = vertex B - A
+    glm::vec4 e2;         // xyz = vertex C - A
+    glm::vec4 normalPad;  // xyz = unit geometric normal
+    glm::vec4 emission;   // rgb = emitted radiance
 };
-static_assert(sizeof(GpuLight) == 8);
-static_assert(offsetof(GpuLight, cdf) == 4);
+static_assert(sizeof(GpuLight) == 80);
+static_assert(offsetof(GpuLight, e1) == 16);
+static_assert(offsetof(GpuLight, e2) == 32);
+static_assert(offsetof(GpuLight, normalPad) == 48);
+static_assert(offsetof(GpuLight, emission) == 64);
 
 /// A deduplicated triangle mesh loaded from Wavefront OBJ + MTL, ready for GPU upload.
 struct Scene {

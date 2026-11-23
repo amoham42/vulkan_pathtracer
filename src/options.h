@@ -10,6 +10,8 @@
 #include <string>
 #include <string_view>
 
+enum class TraceBackend { Auto, RayQuery, RayPipeline };
+
 struct Options {
     std::string scene;          // OBJ file
     uint32_t width = 1024;
@@ -22,6 +24,7 @@ struct Options {
     bool denoise = true;
     bool compare = false;       // headless: also write the un-denoised image
     bool validation = VPT_VALIDATION_DEFAULT != 0;
+    TraceBackend backend = TraceBackend::Auto;
     float exposure = 1.0f;
     float fov = 39.0f;          // vertical, degrees
     std::optional<float> clampLuminance;  // default: 64 when denoising, 0 (off) with --no-denoise

@@ -41,6 +41,7 @@ add_subdirectory(external/glfw)
 
 # ---- shaders: GLSL -> SPIR-V at build time ----
 set(SHADER_SOURCES
+    assets/shaders/pathtrace.comp
     assets/shaders/raygen.rgen
     assets/shaders/closesthit.rchit
     assets/shaders/miss.rmiss

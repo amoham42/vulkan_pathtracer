@@ -109,16 +109,27 @@ Scene loadObj(const std::string& path) {
     }
     if (scene.indices.empty()) throw std::runtime_error(path + " has no triangles");
 
-    // Every emissive triangle is an area light, sampled in proportion to its area.
+    // Every emissive triangle is pre-unpacked into a self-contained GpuLight record (no GPU pointer chasing).
     for (uint32_t t = 0; t < scene.triangleCount(); t++) {
-        if (maxComponent(glm::vec3(scene.materials[scene.materialIds[t]].emission)) <= 0.0f) continue;
+        const glm::vec3 em(scene.materials[scene.materialIds[t]].emission);
+        if (maxComponent(em) <= 0.0f) continue;
         const glm::vec3 a(scene.vertices[scene.indices[3 * t + 0]].position);
         const glm::vec3 b(scene.vertices[scene.indices[3 * t + 1]].position);
         const glm::vec3 c(scene.vertices[scene.indices[3 * t + 2]].position);
-        const float area = 0.5f * glm::length(glm::cross(b - a, c - a));
+        const glm::vec3 e1 = b - a;
+        const glm::vec3 e2 = c - a;
+        const glm::vec3 crossVec = glm::cross(e1, e2);
+        const float crossLen = glm::length(crossVec);
+        const float area = 0.5f * crossLen;
         if (area <= 0.0f) continue;
         scene.lightArea += area;
-        scene.lights.push_back({t, scene.lightArea});
+        scene.lights.push_back({
+            .v0Cdf = glm::vec4(a, scene.lightArea),
+            .e1 = glm::vec4(e1, 0.0f),
+            .e2 = glm::vec4(e2, 0.0f),
+            .normalPad = glm::vec4(crossVec / crossLen, 0.0f),
+            .emission = glm::vec4(em, 0.0f),
+        });
     }
     if (scene.lights.empty())
         std::println(stderr, "[obj] warning: {} has no emissive (Ke) materials; the image will be black", path);

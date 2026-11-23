@@ -37,6 +37,7 @@ Options
   --headless          no window; render to --out and exit
   --compare           headless: also write <out>_noisy.<ext>
   --out FILE          output image (.png, .jpg, .hdr)     (default output.png)
+  --backend MODE      ray backend: auto, rq, rt           (default auto -> ray_query)
   --validation        enable Khronos validation layers
   --no-validation     disable Khronos validation layers
   -h, --help          this text
@@ -213,6 +214,13 @@ std::expected<Options, ParseFailure> parseOptions(std::span<const char* const> a
             auto val = next();
             if (!val) return std::unexpected(val.error());
             o.output = std::string(*val);
+        } else if (a == "--backend") {
+            auto val = next();
+            if (!val) return std::unexpected(val.error());
+            if (*val == "auto") o.backend = TraceBackend::Auto;
+            else if (*val == "rq" || *val == "ray_query") o.backend = TraceBackend::RayQuery;
+            else if (*val == "rt" || *val == "rt_pipeline") o.backend = TraceBackend::RayPipeline;
+            else return fail(std::format("--backend must be auto, rq, or rt, got '{}'", *val));
         } else if (!a.empty() && a[0] == '-') {
             return fail(std::format("unknown option '{}'", a));
         } else {

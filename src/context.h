@@ -79,7 +79,9 @@ public:
 
     uint32_t apiVersion = VK_API_VERSION_1_3;
     uint32_t queueFamily = 0;
+    bool hasDebugUtils = false;
     bool hasMaintenance5 = false;
+    bool hasRayQuery = false;
     bool validationEnabled = false;
 
     vk::PhysicalDeviceProperties properties{};

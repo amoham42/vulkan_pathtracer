@@ -280,42 +280,53 @@ std::string makeNoisyPath(const std::string& output) {
 }
 
 int runHeadless(const Context& ctx, Renderer& renderer, const Options& o) {
-    auto cmd =
-        std::move(ctx.device.allocateCommandBuffers({*ctx.commandPool, vk::CommandBufferLevel::ePrimary, 1}).front());
-    const vk::raii::Fence fence = ctx.device.createFence({});
+    // Double-buffered command buffers + fences keep the GPU queue fed with zero inter-launch bubbles.
+    auto cmds = ctx.device.allocateCommandBuffers({*ctx.commandPool, vk::CommandBufferLevel::ePrimary, 2});
+    std::array<vk::raii::Fence, 2> fences{ctx.device.createFence({}), ctx.device.createFence({})};
+    std::array<bool, 2> inFlight{false, false};
+    std::array<bool, 2> isFinal{false, false};
+
+    auto retireSlot = [&](uint32_t slot, double& traceTotal) {
+        if (!inFlight[slot]) return;
+        if (ctx.device.waitForFences(*fences[slot], VK_TRUE, UINT64_MAX) != vk::Result::eSuccess)
+            throw std::runtime_error("waiting for headless trace failed");
+        inFlight[slot] = false;
+        if (isFinal[slot]) {
+            renderer.finishFrame(slot);
+        } else {
+            renderer.finishTrace(slot);
+        }
+        traceTotal += renderer.traceMs();
+    };
 
     uint32_t remaining = o.targetSpp;
     uint32_t launches = 0;
     double traceTotal = 0.0;
     const auto start = Clock::now();
+    const auto traceStage = renderer.usingRayQuery() ? PS::eComputeShader : PS::eRayTracingShaderKHR;
 
-    // Headless accumulation: trace only on intermediate launches, fuse final denoise + tonemap
-    // into the last submission to avoid any extra command-buffer / fence overhead.
     while (remaining > 0) {
+        const uint32_t slot = launches & 1u;
+        retireSlot(slot, traceTotal);
+
         const uint32_t batchSpp = std::min(remaining, renderer.samplesPerFrame());
         const bool lastLaunch = (remaining == batchSpp);
+        auto& cmd = cmds[slot];
         cmd.reset();
         cmd.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-        renderer.recordTrace(cmd, batchSpp);
+        renderer.recordTrace(cmd, batchSpp, slot);
         if (lastLaunch) {
-            memoryBarrier(cmd, PS::eRayTracingShaderKHR, A::eShaderStorageWrite, PS::eComputeShader,
-                          A::eShaderStorageRead);
-            renderer.recordPost(cmd, false);
+            memoryBarrier(cmd, traceStage, A::eShaderStorageWrite, PS::eComputeShader, A::eShaderStorageRead);
+            renderer.recordPost(cmd, false, slot);
         }
         cmd.end();
 
-        ctx.device.resetFences(*fence);
+        ctx.device.resetFences(*fences[slot]);
         const vk::CommandBufferSubmitInfo cmdInfo(*cmd);
-        ctx.queue.submit2(vk::SubmitInfo2({}, {}, cmdInfo, {}), *fence);
-        if (ctx.device.waitForFences(*fence, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess)
-            throw std::runtime_error("waiting for headless trace failed");
+        ctx.queue.submit2(vk::SubmitInfo2({}, {}, cmdInfo, {}), *fences[slot]);
+        inFlight[slot] = true;
+        isFinal[slot] = lastLaunch;
 
-        if (lastLaunch) {
-            renderer.finishFrame();
-        } else {
-            renderer.finishTrace();
-        }
-        traceTotal += renderer.traceMs();
         remaining -= batchSpp;
         launches++;
         if (launches % 16 == 0 || remaining == 0) {
@@ -323,6 +334,11 @@ int runHeadless(const Context& ctx, Renderer& renderer, const Options& o) {
             std::fflush(stdout);
         }
     }
+
+    // Drain both slots in submission order.
+    const uint32_t lastSlot = (launches - 1u) & 1u;
+    retireSlot(lastSlot ^ 1u, traceTotal);
+    retireSlot(lastSlot, traceTotal);
 
     const double wall = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     const double pixels = double(renderer.extent().width) * renderer.extent().height;
@@ -369,7 +385,8 @@ int main(int argc, char** argv) {
 
         const auto vkMajor = VK_API_VERSION_MAJOR(ctx.apiVersion);
         const auto vkMinor = VK_API_VERSION_MINOR(ctx.apiVersion);
-        std::println("{}  (Vulkan {}.{}{}{})", options.scene, vkMajor, vkMinor,
+        std::println("{}  (Vulkan {}.{}, {}{}{})", options.scene, vkMajor, vkMinor,
+                     renderer.usingRayQuery() ? "ray_query" : "rt_pipeline",
                      ctx.hasMaintenance5 ? ", maintenance5" : "", ctx.validationEnabled ? ", validation" : "");
         std::println("  {} triangles ({} unique vertices), {} emissive, loaded + BVH built in {:.0f} ms on {}",
                      scene.triangleCount(), scene.vertices.size(), scene.lights.size(),

@@ -2,6 +2,7 @@
 
 #include "context.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -140,3 +141,21 @@ void memoryBarrier(const vk::raii::CommandBuffer& cmd, vk::PipelineStageFlags2 s
 void imageBarrier(const vk::raii::CommandBuffer& cmd, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
                   vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess, vk::PipelineStageFlags2 dstStage,
                   vk::AccessFlags2 dstAccess);
+
+/// Scoped VK_EXT_debug_utils GPU command-buffer marker for Nsight Systems / RenderDoc.
+class ScopedGpuLabel {
+public:
+    ScopedGpuLabel(const Context& ctx, const vk::raii::CommandBuffer& cmd, const char* name,
+                   std::array<float, 4> color = {0.2f, 0.6f, 1.0f, 1.0f})
+        : cmd_(ctx.hasDebugUtils ? &cmd : nullptr) {
+        if (cmd_) cmd_->beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT(name, color));
+    }
+    ~ScopedGpuLabel() {
+        if (cmd_) cmd_->endDebugUtilsLabelEXT();
+    }
+    ScopedGpuLabel(const ScopedGpuLabel&) = delete;
+    ScopedGpuLabel& operator=(const ScopedGpuLabel&) = delete;
+
+private:
+    const vk::raii::CommandBuffer* cmd_ = nullptr;
+};

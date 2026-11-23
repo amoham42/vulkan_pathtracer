@@ -4,11 +4,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// Unidirectional path tracer with next-event estimation and multiple importance sampling.
-// Each launch traces `spp` paths through its pixel and folds the average into a float accumulation
-// buffer (rgb = mean radiance, a = mean squared luminance for SVGF sample variance). It also
-// accumulates the albedo, normal and depth of the first non-specular surface, which guide the
-// denoiser (atrous.comp); albedo.a marks pixels that see a light directly.
+// Unidirectional path tracer (VK_KHR_ray_tracing_pipeline backend) with NEE + MIS.
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba32f) uniform image2D accumImage;
@@ -21,16 +17,16 @@ layout(set = 0, binding = 7, rgba16f) uniform image2D albedoImage;
 layout(set = 0, binding = 8, rgba32f) uniform image2D normalDepthImage;
 
 layout(push_constant) uniform Frame {
-    vec4 eye;              // xyz position, w = tan(fov / 2)
-    vec4 right;            // xyz, w = aspect ratio
+    vec4 eye;
+    vec4 right;
     vec4 up;
     vec4 forward;
-    uint prevSamples;      // samples already accumulated (0 = start over)
-    uint spp;              // paths per pixel this launch
+    uint prevSamples;
+    uint spp;
     uint maxDepth;
     uint lightCount;
     float lightArea;
-    float clampLuminance;  // per-path firefly clamp, 0 = off
+    float clampLuminance;
     uint seed;
     uint frameIndex;
 } pc;
@@ -38,9 +34,6 @@ layout(push_constant) uniform Frame {
 layout(location = 0) rayPayloadEXT HitPayload hit;
 layout(location = 1) rayPayloadEXT uint shadowVisible;
 
-// ---- sampling helpers ----
-
-// Orthonormal basis around n (Duff et al. 2017)
 void basis(vec3 n, out vec3 t, out vec3 b) {
     const float s = n.z >= 0.0 ? 1.0 : -1.0;
     const float a = -1.0 / (s + n.z);
@@ -67,7 +60,6 @@ vec3 samplePhongLobe(float u1, float u2, float exponent) {
     return vec3(sinA * cos(phi), sinA * sin(phi), cosA);
 }
 
-// Moves a ray origin off the surface by a few ULPs (Wächter & Binder, Ray Tracing Gems ch. 6).
 vec3 offsetRay(vec3 p, vec3 n) {
     const float origin = 1.0 / 32.0, floatScale = 1.0 / 65536.0, intScale = 256.0;
     const ivec3 o = ivec3(intScale * n);
@@ -84,53 +76,45 @@ float powerHeuristic(float a, float b) {
     return a2 / max(a2 + b * b, 1e-20);
 }
 
-// ---- BSDFs: Lambert, and Lambert + normalized Phong for glossy ----
-
 float specularProbability(GpuMaterial m) {
     const float d = luminance(m.diffuse.rgb), s = luminance(m.specular.rgb);
     return d + s > 0.0 ? s / (d + s) : 0.0;
 }
 
-vec3 evalBsdf(GpuMaterial m, vec3 n, vec3 wo, vec3 wi, out float pdf) {
+vec3 evalGlossyBsdf(GpuMaterial m, vec3 n, vec3 wo, vec3 wi, out float pdf) {
     const float cosI = dot(n, wi);
     if (cosI <= 0.0) {
         pdf = 0.0;
         return vec3(0.0);
     }
-    vec3 f = m.diffuse.rgb / PI;
-    pdf = cosI / PI;
-    if (uint(m.diffuse.w) == MAT_GLOSSY) {
-        const float ps = specularProbability(m), e = m.specular.w;
-        const float lobe = pow(max(0.0, dot(reflect(-wo, n), wi)), e);
-        f += m.specular.rgb * (e + 2.0) / (2.0 * PI) * lobe;
-        pdf = (1.0 - ps) * pdf + ps * (e + 1.0) / (2.0 * PI) * lobe;
-    }
-    return f;
+    const float ps = specularProbability(m), e = m.specular.w;
+    const float lobe = pow(max(0.0, dot(reflect(-wo, n), wi)), e);
+    pdf = (1.0 - ps) * (cosI / PI) + ps * (e + 1.0) / (2.0 * PI) * lobe;
+    return m.diffuse.rgb / PI + m.specular.rgb * (e + 2.0) / (2.0 * PI) * lobe;
 }
 
-// Picks a point on an emitter, in proportion to area. Returns radiance and the solid-angle pdf.
-bool sampleLight(vec3 p, inout uint rng, out vec3 wi, out float dist, out vec3 radiance, out float pdf) {
-    const float x = rnd(rng) * pc.lightArea;
-    uint lo = 0u, hi = pc.lightCount - 1u;
-    while (lo < hi) {
-        const uint mid = (lo + hi) >> 1u;
-        if (lights[mid].cdf < x) lo = mid + 1u; else hi = mid;
+bool sampleLight(vec3 p, float invLightArea, inout uint rng, out vec3 wi, out float dist, out vec3 radiance, out float pdf) {
+    uint lo = 0u;
+    if (pc.lightCount > 1u) {
+        const float x = rnd(rng) * pc.lightArea;
+        uint hi = pc.lightCount - 1u;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1u;
+            if (lights[mid].v0Cdf.w < x) lo = mid + 1u; else hi = mid;
+        }
     }
-    const uint tri = lights[lo].triangle;
-    const vec3 a = vertices[indices[3 * tri + 0]].position.xyz;
-    const vec3 b = vertices[indices[3 * tri + 1]].position.xyz;
-    const vec3 c = vertices[indices[3 * tri + 2]].position.xyz;
+    const GpuLight lt = lights[lo];
     const float su = sqrt(rnd(rng)), v = rnd(rng);
-    const vec3 q = a * (1.0 - su) + b * (su * (1.0 - v)) + c * (su * v);
+    const vec3 q = lt.v0Cdf.xyz + (su * (1.0 - v)) * lt.e1.xyz + (su * v) * lt.e2.xyz;
 
     const vec3 d = q - p;
     const float d2 = dot(d, d);
     dist = sqrt(d2);
     wi = d / dist;
-    const float cosL = abs(dot(normalize(cross(b - a, c - a)), wi));  // emitters are two-sided
+    const float cosL = abs(dot(lt.normalPad.xyz, wi));
     if (cosL < 1e-6) return false;
-    pdf = d2 / (cosL * pc.lightArea);
-    radiance = materials[materialIds[tri]].emission.rgb;
+    pdf = (d2 * invLightArea) / cosL;
+    radiance = lt.emission.rgb;
     return true;
 }
 
@@ -141,12 +125,12 @@ bool visible(vec3 origin, vec3 dir, float dist) {
     return shadowVisible == 1u;
 }
 
-// Exact Fresnel reflectance of a smooth dielectric.
 float fresnel(float cosI, float etaI, float etaT, out float cosT) {
-    const float sin2T = (etaI / etaT) * (etaI / etaT) * max(0.0, 1.0 - cosI * cosI);
+    const float eta = etaI / etaT;
+    const float sin2T = eta * eta * max(0.0, 1.0 - cosI * cosI);
     if (sin2T >= 1.0) {
         cosT = 0.0;
-        return 1.0;  // total internal reflection
+        return 1.0;
     }
     cosT = sqrt(1.0 - sin2T);
     const float rs = (etaI * cosI - etaT * cosT) / (etaI * cosI + etaT * cosT);
@@ -155,10 +139,11 @@ float fresnel(float cosI, float etaI, float etaT, out float cosT) {
 }
 
 void main() {
+    const float invLightArea = pc.lightArea > 0.0 ? 1.0 / pc.lightArea : 0.0;
     uint rng = pcgHash(gl_LaunchIDEXT.x + pcgHash(gl_LaunchIDEXT.y + pcgHash(pc.frameIndex * 9781u + pc.seed)));
 
-    vec4 radianceSum = vec4(0.0);    // rgb = radiance sum, a = lum^2 sum
-    vec4 albedoSum = vec4(0.0);      // a = fraction of paths whose guide surface is not a light
+    vec4 radianceSum = vec4(0.0);
+    vec4 albedoSum = vec4(0.0);
     vec4 normalDepthSum = vec4(0.0);
 
     for (uint s = 0u; s < pc.spp; s++) {
@@ -167,9 +152,7 @@ void main() {
         vec3 origin = pc.eye.xyz;
 
         vec3 L = vec3(0.0), beta = vec3(1.0);
-        // lastPdf < 0 encodes a delta/camera event (avoid keeping an extra bool live across traceRayEXT).
         float lastPdf = -1.0;
-        // pathLength < 0 encodes guideWritten = true (eliminates 9 live VGPRs across traceRayEXT!).
         float pathLength = 0.0;
 
         for (uint depth = 0u; depth < pc.maxDepth; depth++) {
@@ -178,26 +161,25 @@ void main() {
             if (pathLength >= 0.0) pathLength += hit.t;
 
             const GpuMaterial m = materials[hit.material];
-            const uint type = uint(m.diffuse.w);
             const vec3 wo = -dir;
             const vec3 n = hit.normal;
 
-            // Hit a light: weigh it against the light sample taken at the previous vertex.
             if (max(m.emission.r, max(m.emission.g, m.emission.b)) > 0.0) {
                 float w = 1.0;
                 if (lastPdf >= 0.0) {
                     const float cosL = max(abs(dot(hit.geoNormal, wo)), 1e-6);
-                    w = powerHeuristic(lastPdf, hit.t * hit.t / (cosL * pc.lightArea));
+                    w = powerHeuristic(lastPdf, (hit.t * hit.t * invLightArea) / cosL);
                 }
                 L += beta * m.emission.rgb * w;
                 if (pathLength >= 0.0) {
-                    albedoSum += vec4(1.0, 1.0, 1.0, 0.0);  // light seen directly: denoiser leaves it crisp
+                    albedoSum += vec4(1.0, 1.0, 1.0, 0.0);
                     normalDepthSum += vec4(n, pathLength);
                     pathLength = -1.0;
                 }
                 break;
             }
 
+            const uint type = uint(m.diffuse.w);
             if (pathLength >= 0.0 && type != MAT_MIRROR && type != MAT_DIELECTRIC) {
                 const vec3 alb = min(m.diffuse.rgb + (type == MAT_GLOSSY ? m.specular.rgb : vec3(0.0)), vec3(1.0));
                 albedoSum += vec4(alb, 1.0);
@@ -206,28 +188,41 @@ void main() {
             }
 
             vec3 offsetNormal = hit.geoNormal;
-            if (type == MAT_DIFFUSE || type == MAT_GLOSSY) {
-                // Next-event estimation: one shadow ray to a point on a light.
+            if (type == MAT_DIFFUSE) {
                 vec3 wi, Le;
                 float dist, pdfLight;
-                if (pc.lightCount > 0u && sampleLight(hit.position, rng, wi, dist, Le, pdfLight) &&
+                if (pc.lightCount > 0u && sampleLight(hit.position, invLightArea, rng, wi, dist, Le, pdfLight) &&
+                    dot(wi, hit.geoNormal) > 0.0) {
+                    const float cosI = dot(n, wi);
+                    if (cosI > 0.0 && visible(offsetRay(hit.position, hit.geoNormal), wi, dist)) {
+                        const float pdfBsdf = cosI * (1.0 / PI);
+                        L += beta * m.diffuse.rgb * Le * (pdfBsdf * powerHeuristic(pdfLight, pdfBsdf) / pdfLight);
+                    }
+                }
+                dir = toWorld(sampleCosine(rnd(rng), rnd(rng)), n);
+                const float cosDir = dot(n, dir);
+                if (cosDir <= 0.0 || dot(dir, hit.geoNormal) <= 0.0) break;
+                beta *= m.diffuse.rgb;
+                lastPdf = cosDir * (1.0 / PI);
+            } else if (type == MAT_GLOSSY) {
+                vec3 wi, Le;
+                float dist, pdfLight;
+                if (pc.lightCount > 0u && sampleLight(hit.position, invLightArea, rng, wi, dist, Le, pdfLight) &&
                     dot(wi, hit.geoNormal) > 0.0) {
                     float pdfBsdf;
-                    const vec3 f = evalBsdf(m, n, wo, wi, pdfBsdf);
+                    const vec3 f = evalGlossyBsdf(m, n, wo, wi, pdfBsdf);
                     if (pdfBsdf > 0.0 && visible(offsetRay(hit.position, hit.geoNormal), wi, dist)) {
                         L += beta * f * Le * dot(n, wi) * powerHeuristic(pdfLight, pdfBsdf) / pdfLight;
                     }
                 }
-
-                // Continue the path by sampling the BSDF.
-                const float ps = type == MAT_GLOSSY ? specularProbability(m) : 0.0;
+                const float ps = specularProbability(m);
                 if (rnd(rng) < ps) {
                     dir = toWorld(samplePhongLobe(rnd(rng), rnd(rng), m.specular.w), reflect(-wo, n));
                 } else {
                     dir = toWorld(sampleCosine(rnd(rng), rnd(rng)), n);
                 }
                 float pdf;
-                const vec3 f = evalBsdf(m, n, wo, dir, pdf);
+                const vec3 f = evalGlossyBsdf(m, n, wo, dir, pdf);
                 if (pdf <= 0.0 || dot(dir, hit.geoNormal) <= 0.0) break;
                 beta *= f * dot(n, dir) / pdf;
                 lastPdf = pdf;
@@ -235,7 +230,7 @@ void main() {
                 dir = reflect(-wo, n);
                 beta *= m.specular.rgb;
                 lastPdf = -1.0;
-            } else {  // dielectric: reflect or refract, chosen by exact Fresnel
+            } else {
                 const float ior = m.emission.w;
                 const float etaI = hit.frontFace == 1u ? 1.0 : ior;
                 const float etaT = hit.frontFace == 1u ? ior : 1.0;
@@ -244,14 +239,14 @@ void main() {
                 if (rnd(rng) < fresnel(cosI, etaI, etaT, cosT)) {
                     dir = reflect(-wo, n);
                 } else {
-                    dir = normalize((etaI / etaT) * -wo + ((etaI / etaT) * cosI - cosT) * n);
+                    const float eta = etaI / etaT;
+                    dir = normalize(eta * -wo + (eta * cosI - cosT) * n);
                     offsetNormal = -hit.geoNormal;
                 }
                 lastPdf = -1.0;
             }
             origin = offsetRay(hit.position, offsetNormal);
 
-            // Russian roulette once the path has carried a few bounces.
             if (depth >= 3u) {
                 const float q = clamp(max(beta.r, max(beta.g, beta.b)), 0.05, 0.95);
                 if (rnd(rng) > q) break;
@@ -259,7 +254,7 @@ void main() {
             }
         }
 
-        if (pathLength >= 0.0) {  // escaped without hitting a diffuse/glossy surface or light
+        if (pathLength >= 0.0) {
             albedoSum += vec4(1.0);
             normalDepthSum += vec4(0.0, 0.0, 0.0, 1e4);
         }
@@ -278,16 +273,24 @@ void main() {
     const float inv = 1.0 / float(pc.spp);
     const vec4 radiance = radianceSum * inv;
     const vec4 albedo = albedoSum * inv;
-    const vec4 normalDepth = normalDepthSum * inv;
+    vec4 normalDepth = normalDepthSum * inv;
 
     if (pc.prevSamples == 0u) {
+        if (albedo.a < 0.5) normalDepth.w = -abs(normalDepth.w);
         imageStore(accumImage, pixel, radiance);
         imageStore(albedoImage, pixel, albedo);
         imageStore(normalDepthImage, pixel, normalDepth);
     } else {
         const float w = float(pc.spp) / float(pc.prevSamples + pc.spp);
+        const vec4 prevAlb = imageLoad(albedoImage, pixel);
+        const vec4 newAlb = mix(prevAlb, albedo, w);
+        vec4 prevNd = imageLoad(normalDepthImage, pixel);
+        prevNd.w = abs(prevNd.w);
+        vec4 newNd = mix(prevNd, normalDepth, w);
+        if (newAlb.a < 0.5) newNd.w = -abs(newNd.w);
+
         imageStore(accumImage, pixel, mix(imageLoad(accumImage, pixel), radiance, w));
-        imageStore(albedoImage, pixel, mix(imageLoad(albedoImage, pixel), albedo, w));
-        imageStore(normalDepthImage, pixel, mix(imageLoad(normalDepthImage, pixel), normalDepth, w));
+        imageStore(albedoImage, pixel, newAlb);
+        imageStore(normalDepthImage, pixel, newNd);
     }
 }

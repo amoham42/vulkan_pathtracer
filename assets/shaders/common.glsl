@@ -21,9 +21,13 @@ struct GpuMaterial {
     vec4 emission;  // rgb radiance, w = index of refraction
 };
 
+// Pre-unpacked emissive triangle so sampleLight() needs zero index/vertex/material pointer chasing.
 struct GpuLight {
-    uint triangle;
-    float cdf;
+    vec4 v0Cdf;      // xyz = vertex A, w = running area CDF
+    vec4 e1;         // xyz = vertex B - A
+    vec4 e2;         // xyz = vertex C - A
+    vec4 normalPad;  // xyz = unit geometric normal
+    vec4 emission;   // rgb = emitted radiance
 };
 
 struct HitPayload {

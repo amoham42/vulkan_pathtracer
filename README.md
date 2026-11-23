@@ -14,10 +14,10 @@ A physically based path tracer built with **C++23**, **Vulkan-Hpp RAII** (`vulka
 ## Features
 
 - **Modern Vulkan 1.3 / 1.4.** Auto-negotiates Vulkan 1.4 when supported by both SDK and driver (falling back cleanly to 1.3), uses `vulkan_raii.hpp` (no global dispatcher), **VMA** for sub-allocated buffers/images with persistent host mapping, **batched single-submission startup** (`UploadBatch`), `synchronization2` (`vkQueueSubmit2` + fences), and Vulkan 1.4-promoted `VK_KHR_push_descriptor` and `VK_KHR_maintenance5` (inline shader modules).
-- **Hardware ray tracing.** A deduplicated-vertex BLAS/TLAS acceleration structure with raygen, closest-hit and two miss shaders on the RT cores. Shadow rays use `TerminateOnFirstHit | SkipClosestHitShader`, and `raygen.rgen` minimises live continuation registers across `traceRayEXT` for high warp occupancy.
+- **Hardware ray tracing (`VK_KHR_ray_query` + `VK_KHR_ray_tracing_pipeline`).** Defaults to inline hardware ray tracing (`assets/shaders/pathtrace.comp`) in coherent 8×8 compute tiles on the RT cores—eliminating SBT dispatch, continuation-state spilling, and payload marshaling—with automatic fallback (and `--backend rt`) to the ray-tracing pipeline. Pre-unpacked area-light records eliminate indirect pointer chasing on every bounce, and double-buffered headless submissions eliminate CPU/GPU queue bubbles.
 - **Unbiased light transport.** Next-event estimation (one shadow ray to a light per bounce) combined with BSDF sampling through **multiple importance sampling** (power heuristic). Area-weighted light selection, exact arbitrary-`--spp` accumulation weighting, Russian roulette, and Ray Tracing Gems ray-origin offsets.
 - **Materials from MTL.** Lambertian diffuse with cosine-weighted sampling; glossy as Lambert plus an energy-conserving normalized Phong lobe; perfect mirrors; and smooth dielectrics with exact Fresnel, refraction and total internal reflection.
-- **Real-time SVGF-guided À-Trous denoising.** Five compute passes (~2.7–3.7 ms) guided by first non-specular albedo, normal and depth buffers, propagating per-pixel Monte Carlo variance (packed into `accumImage.a`) across passes. Lighting is filtered with the albedo divided out so surface colour stays sharp.
+- **Real-time SVGF-guided À-Trous denoising.** Five compute passes (~2.3–3.1 ms) guided by first non-specular albedo, normal and depth buffers, propagating per-pixel Monte Carlo variance (packed into `accumImage.a`) and light-mask sign bit (in `normalDepth.w`) across passes so passes 1–4 skip `albedoImage` completely. Lighting is filtered with the albedo divided out so surface colour stays sharp.
 - **HDR pipeline & multi-format output.** Float32 accumulation with ACES filmic tonemap + sRGB encoding for PNG/JPG, or direct linear float32 export to Radiance `.hdr`.
 - **Interactive resizable viewer & headless mode.** Live swapchain/render-target recreation on resize, GPU timestamp timings in the title bar, runtime `--validation`, configurable `--clamp`, and `--compare` for raw vs. denoised output.
 
@@ -38,13 +38,13 @@ At low sample counts the raw image is mostly noise. Five À-Trous passes cover a
 
 ## Performance
 
-Measured on an **NVIDIA RTX 3070 Laptop GPU** (`--headless --spp 128`, 16 spp/launch, max depth 8, from GPU timestamp queries):
+Measured on an **NVIDIA RTX 3070 Laptop GPU** (`--headless`, default `VK_KHR_ray_query` backend, 16 spp/launch, max depth 8, from GPU timestamp queries):
 
-| Scene | Resolution | GPU Trace (128 spp) | Throughput | Final Denoise + Tonemap | Total Wall |
-|---|---|---:|---:|---:|---:|
-| CornellBox-Original | 1200 × 1200 | 138 ms | 1,333 M paths/s | 3.72 ms | 162 ms |
-| CornellBox-Sphere | 1024 × 1024 | 291 ms | 460 M paths/s | 2.71 ms | 316 ms |
-| CornellBox-Glossy | 1024 × 1024 | 299 ms | 449 M paths/s | 3.86 ms | 323 ms |
+| Scene | Resolution | Samples | GPU Trace | Throughput | Final Denoise + Tonemap | Total Wall |
+|---|---|---:|---:|---:|---:|---:|
+| CornellBox-Original | 1200 × 1200 | 128 spp | 86 ms | 2,145 M paths/s | 3.07 ms | 91 ms |
+| CornellBox-Sphere | 1024 × 1024 | 256 spp | 385 ms | 697 M paths/s | 2.27 ms | 390 ms |
+| CornellBox-Glossy | 1024 × 1024 | 256 spp | 397 ms | 677 M paths/s | 2.27 ms | 401 ms |
 
 ## How it works
 
@@ -64,9 +64,8 @@ Measured on an **NVIDIA RTX 3070 Laptop GPU** (`--headless --spp 128`, 16 spp/la
 
 | File | Purpose |
 |---|---|
-| `assets/shaders/raygen.rgen` | path tracer: camera rays, BSDF sampling, NEE, MIS, exact accumulation + second moment |
-| `assets/shaders/closesthit.rchit` | triangle fetch, interpolated normal, front-face resolution |
-| `assets/shaders/miss.rmiss`, `shadow.rmiss` | escaped path / visible light |
+| `assets/shaders/pathtrace.comp` | default `VK_KHR_ray_query` path tracer: 8×8 coherent tiles, NEE + MIS, pre-unpacked lights, exact accumulation |
+| `assets/shaders/raygen.rgen`, `closesthit.rchit`, `miss.rmiss`, `shadow.rmiss` | `VK_KHR_ray_tracing_pipeline` fallback backend (`--backend rt`) |
 | `assets/shaders/atrous.comp`, `tonemap.comp` | SVGF variance-propagating À-Trous denoiser, ACES + sRGB display transform |
 | `src/renderer.cpp` | batched startup uploads, pipelines (`maintenance5`), push descriptors, SBT, frame recording, PNG/JPG/HDR export |
 | `src/resources.cpp` | VMA-backed RAII `Buffer`, `Image`, `Accel`, `UploadBatch`, synchronization2 barriers |

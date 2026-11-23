@@ -76,7 +76,7 @@ Context::Context(bool windowed, uint32_t width, uint32_t height, bool enableVali
         instanceExtensions.assign(names, names + count);
     }
 
-    const bool hasDebugUtils = hasInstanceExtension(raiiContext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    hasDebugUtils = hasInstanceExtension(raiiContext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (hasDebugUtils) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
     apiVersion = negotiateApiVersion(raiiContext.enumerateInstanceVersion());
@@ -124,22 +124,30 @@ Context::Context(bool windowed, uint32_t width, uint32_t height, bool enableVali
     // Cap effective API version to what the physical device itself supports.
     apiVersion = std::min(apiVersion, properties.apiVersion);
 
-    // Enable Vulkan 1.4-promoted maintenance5 when supported for inline ShaderModule creation.
+    // Enable Vulkan 1.4-promoted maintenance5 and VK_KHR_ray_query when supported.
     hasMaintenance5 = hasExtension(physicalDevice, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     if (hasMaintenance5) deviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    hasRayQuery = hasExtension(physicalDevice, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    if (hasRayQuery) deviceExtensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
     const float priority = 1.0f;
     const vk::DeviceQueueCreateInfo queueInfo({}, queueFamily, 1, &priority);
 
     vk::StructureChain<vk::DeviceCreateInfo, vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
                        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR, vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
-                       vk::PhysicalDeviceMaintenance5FeaturesKHR>
+                       vk::PhysicalDeviceRayQueryFeaturesKHR, vk::PhysicalDeviceMaintenance5FeaturesKHR>
         chain;
     chain.get<vk::DeviceCreateInfo>().setQueueCreateInfos(queueInfo).setPEnabledExtensionNames(deviceExtensions);
     chain.get<vk::PhysicalDeviceVulkan12Features>().setBufferDeviceAddress(true).setScalarBlockLayout(true);
     chain.get<vk::PhysicalDeviceVulkan13Features>().setSynchronization2(true);
     chain.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().setRayTracingPipeline(true);
     chain.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>().setAccelerationStructure(true);
+    if (hasRayQuery) {
+        chain.get<vk::PhysicalDeviceRayQueryFeaturesKHR>().setRayQuery(true);
+    } else {
+        chain.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+    }
     if (hasMaintenance5) {
         chain.get<vk::PhysicalDeviceMaintenance5FeaturesKHR>().setMaintenance5(true);
     } else {
