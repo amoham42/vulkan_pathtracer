@@ -1,21 +1,28 @@
 #version 460
 
-// One pass of the edge-avoiding À-Trous wavelet filter (Dammertz et al., HPG 2010) with
-// SVGF variance propagation (Schied et al., HPG 2017).
-// Optimization: light-pixel mask is packed into the sign bit of normalDepthImage.w (< 0 = light),
-// so passes 1..4 never touch albedoImage (eliminating 100 imageLoads/pixel across passes 1..4),
-// pow(x, 64) uses 6 squarings, and the center tap skips transcendental weights.
+// Edge-avoiding À-Trous wavelet filter (Dammertz et al., HPG 2010) with SVGF variance propagation.
+// Compiled in two specialized variants:
+//   - PASS0 (stepWidth=1, rgba32f -> rgba16f): cooperatively loads a 20x20 demodulated tile into shared
+//     memory so both the 3x3 firefly/variance pass and 5x5 filter execute from on-chip SRAM.
+//   - Passes 1..4 (rgba16f -> rgba16f): zero demodulate branches, never touches albedoImage, and reads
+//     pre-normalized FP16 normalDepth directly (2x lower memory bandwidth).
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+#ifdef PASS0
 layout(set = 0, binding = 0, rgba32f) uniform readonly image2D src;
-layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D dst;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
 layout(set = 0, binding = 2, rgba16f) uniform readonly image2D albedoImage;
-layout(set = 0, binding = 3, rgba32f) uniform readonly image2D normalDepthImage;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D normalDepthImage;
+#else
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D normalDepthImage;
+#endif
 
 layout(push_constant) uniform Post {
     int stepWidth;
-    int demodulate;      // 1 on pass 0
+    int demodulate;
     float sigmaColor;
     float normalPower;
     float sigmaDepth;
@@ -38,72 +45,91 @@ float pow64(float x) {
     return x;
 }
 
+#ifdef PASS0
+shared vec4 sCol[20][20];  // rgb = demodulated lighting
+shared vec4 sNd[20][20];   // xyz = unit normal, w = signed depth (< 0 = light)
+#endif
+
 void main() {
     const ivec2 size = imageSize(src);
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+#ifdef PASS0
+    // Cooperatively load the 16x16 workgroup + 2-pixel halo into shared memory (400 texels across 256 threads).
+    const ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(2);
+    for (uint idx = gl_LocalInvocationIndex; idx < 400u; idx += 256u) {
+        const int ty = int(idx / 20u);
+        const int tx = int(idx - uint(ty) * 20u);
+        const ivec2 gp = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), size - 1);
+        const vec3 raw = imageLoad(src, gp).rgb;
+        const vec3 alb = max(imageLoad(albedoImage, gp).rgb, vec3(1e-3));
+        sCol[ty][tx] = vec4(raw / alb, 0.0);
+        sNd[ty][tx] = imageLoad(normalDepthImage, gp);
+    }
+    barrier();
+#endif
+
     if (any(greaterThanEqual(p, size))) return;
 
-    const vec4 srcP = imageLoad(src, p);
-    const vec4 ndP = imageLoad(normalDepthImage, p);
-    const bool isLightP = ndP.w < 0.0;
-
-    vec3 cP = srcP.rgb;
-    vec3 albP = vec3(1.0);
-    if (pc.demodulate == 1) {
-        albP = max(imageLoad(albedoImage, p).rgb, vec3(1e-3));
-        cP /= albP;
-    }
-
-    if (isLightP) {
-        imageStore(dst, p, vec4(cP, 0.0));
+#ifdef PASS0
+    const int lx = int(gl_LocalInvocationID.x) + 2;
+    const int ly = int(gl_LocalInvocationID.y) + 2;
+    const vec4 ndP = sNd[ly][lx];
+    vec3 cP = sCol[ly][lx].rgb;
+    if (ndP.w < 0.0) {
+        imageStore(dst, p, vec4(min(cP, vec3(65000.0)), 0.0));
         return;
     }
 
-    vec3 tP = cP / (1.0 + cP);
-    float variance = 0.0;
-
-    if (pc.demodulate == 1) {
-        vec3 mean = vec3(0.0), meanSq = vec3(0.0);
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                if (dx == 0 && dy == 0) continue;
-                const ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), size - 1);
-                const vec3 c = imageLoad(src, q).rgb / max(imageLoad(albedoImage, q).rgb, vec3(1e-3));
-                const vec3 t = c / (1.0 + c);
-                mean += t;
-                meanSq += t * t;
-            }
+    vec3 mean = vec3(0.0), meanSq = vec3(0.0);
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            const vec3 c = sCol[ly + dy][lx + dx].rgb;
+            const vec3 t = c / (1.0 + c);
+            mean += t;
+            meanSq += t * t;
         }
-        mean *= (1.0 / 8.0);
-        const vec3 sd = sqrt(max(meanSq * (1.0 / 8.0) - mean * mean, vec3(0.0)));
-        const float spatialVar = dot(sd, sd) * (1.0 / 3.0);
-
-        // Firefly clamp
-        tP = clamp(tP, mean - 2.5 * sd, mean + 2.5 * sd);
-        tP = min(tP, vec3(0.999));
-        cP = tP / (1.0 - tP);
-
-        const float rawLum = max(luminance(srcP.rgb), 0.0);
-        const float mcVarLum = max(0.0, srcP.a - rawLum * rawLum) / max(float(pc.totalSamples), 1.0);
-        const float albLum = max(luminance(albP), 1e-3);
-        const float demodLum = max(luminance(cP), 0.0);
-        const float onePlus = 1.0 + demodLum;
-        const float onePlus2 = onePlus * onePlus;
-        const float mcVarT = mcVarLum / (albLum * albLum * onePlus2 * onePlus2);
-        variance = (pc.totalSamples >= 4u) ? mix(mcVarT, spatialVar, 0.35) : spatialVar;
-    } else {
-        variance = max(srcP.a, 0.0);
     }
+    mean *= (1.0 / 8.0);
+    const vec3 sd = sqrt(max(meanSq * (1.0 / 8.0) - mean * mean, vec3(0.0)));
+    const float spatialVar = dot(sd, sd) * (1.0 / 3.0);
+
+    vec3 tP = cP / (1.0 + cP);
+    tP = clamp(tP, mean - 2.5 * sd, mean + 2.5 * sd);
+    tP = min(tP, vec3(0.999));
+    cP = tP / (1.0 - tP);
+
+    const vec4 srcP = imageLoad(src, p);
+    const vec3 albP = max(imageLoad(albedoImage, p).rgb, vec3(1e-3));
+    const float rawLum = max(luminance(srcP.rgb), 0.0);
+    const float mcVarLum = max(0.0, srcP.a - rawLum * rawLum) / max(float(pc.totalSamples), 1.0);
+    const float albLum = max(luminance(albP), 1e-3);
+    const float demodLum = max(luminance(cP), 0.0);
+    const float onePlus = 1.0 + demodLum;
+    const float onePlus2 = onePlus * onePlus;
+    const float mcVarT = mcVarLum / (albLum * albLum * onePlus2 * onePlus2);
+    const float variance = (pc.totalSamples >= 4u) ? mix(mcVarT, spatialVar, 0.35) : spatialVar;
+#else
+    const vec4 srcP = imageLoad(src, p);
+    const vec4 ndP = imageLoad(normalDepthImage, p);
+    const vec3 cP = srcP.rgb;
+    if (ndP.w < 0.0) {
+        imageStore(dst, p, vec4(cP, 0.0));
+        return;
+    }
+    const vec3 tP = cP / (1.0 + cP);
+    const float variance = max(srcP.a, 0.0);
+#endif
 
     const float invColorScale = -1.0 / (3.0 * (pc.sigmaColor * pc.sigmaColor * variance + 1e-4));
-    const float lenP = length(ndP.xyz);
-    const vec3 nP = lenP > 1e-4 ? ndP.xyz / lenP : vec3(0.0);
-    const float zP = abs(ndP.w);
+    const vec3 nP = ndP.xyz;
+    const bool hasNormalP = dot(nP, nP) > 0.25;
+    const float zP = ndP.w;  // >= 0 because light pixels returned early
     const float invDepthScale = -1.0 / (max(zP, 1e-3) * pc.sigmaDepth * float(pc.stepWidth));
-    const bool hasNormalP = lenP > 1e-4;
     const bool fastPow64 = (pc.normalPower == 64.0);
 
-    // Seed center tap (dx == 0, dy == 0) directly: wColor = wNormal = wDepth = 1.0.
+    // Seed center tap directly: wColor = wNormal = wDepth = 1.0.
     const float w0 = kernel[0] * kernel[0];
     vec3 sum = cP * w0;
     float sumVar = variance * w0 * w0;
@@ -118,21 +144,26 @@ void main() {
             const int qx = p.x + dx * pc.stepWidth;
             if (qx < 0 || qx >= size.x) continue;
 
+#ifdef PASS0
+            const vec4 ndQ = sNd[ly + dy][lx + dx];
+            if (ndQ.w < 0.0) continue;
+            const vec3 cQ = sCol[ly + dy][lx + dx].rgb;
+            const float varQ = variance;
+#else
             const ivec2 q = ivec2(qx, qy);
             const vec4 ndQ = imageLoad(normalDepthImage, q);
-            if (ndQ.w < 0.0) continue;  // light pixel: never blur into surroundings
-
+            if (ndQ.w < 0.0) continue;
             const vec4 srcQ = imageLoad(src, q);
-            const vec3 cQ = (pc.demodulate == 1) ? (srcQ.rgb / max(imageLoad(albedoImage, q).rgb, vec3(1e-3))) : srcQ.rgb;
-            const float varQ = (pc.demodulate == 1) ? variance : max(srcQ.a, 0.0);
+            const vec3 cQ = srcQ.rgb;
+            const float varQ = max(srcQ.a, 0.0);
+#endif
 
             const vec3 dt = tP - cQ / (1.0 + cQ);
             const float wColor = exp(dot(dt, dt) * invColorScale);
 
-            const float lenQ = length(ndQ.xyz);
             float wNormal = 1.0;
-            if (hasNormalP && lenQ > 1e-4) {
-                const float ndot = max(0.0, dot(nP, ndQ.xyz / lenQ));
+            if (hasNormalP && dot(ndQ.xyz, ndQ.xyz) > 0.25) {
+                const float ndot = max(0.0, dot(nP, ndQ.xyz));
                 wNormal = fastPow64 ? pow64(ndot) : pow(ndot, pc.normalPower);
             }
 
@@ -144,5 +175,5 @@ void main() {
         }
     }
     const float invW = 1.0 / weightSum;
-    imageStore(dst, p, vec4(sum * invW, sumVar * invW * invW));
+    imageStore(dst, p, vec4(min(sum * invW, vec3(65000.0)), min(sumVar * invW * invW, 65000.0)));
 }

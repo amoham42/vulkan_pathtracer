@@ -152,17 +152,19 @@ Renderer::Renderer(const Context& context, const Scene& scene, const Options& o)
 void Renderer::createImages(UploadBatch& batch) {
     using U = vk::ImageUsageFlagBits;
     const auto usage = U::eStorage | U::eTransferDst | U::eTransferSrc;
+    // Keep accum_ at FP32 for unbiased progressive accumulation; pingA_/pingB_/normalDepth_ use FP16 (2x lower bandwidth).
     accum_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    pingA_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
-    pingB_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    pingA_ = batch.createImage(extent_, vk::Format::eR16G16B16A16Sfloat, usage);
+    pingB_ = batch.createImage(extent_, vk::Format::eR16G16B16A16Sfloat, usage);
     albedo_ = batch.createImage(extent_, vk::Format::eR16G16B16A16Sfloat, usage);
-    normalDepth_ = batch.createImage(extent_, vk::Format::eR32G32B32A32Sfloat, usage);
+    normalDepth_ = batch.createImage(extent_, vk::Format::eR16G16B16A16Sfloat, usage);
     ldr_ = batch.createImage(extent_, vk::Format::eR8G8B8A8Unorm, usage);
 }
 
 void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
     using K = Buffer::Kind;
-    vertexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const GpuVertex>(scene.vertices));
+    vertexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const glm::vec3>(scene.positions));
+    normalBuffer_ = batch.createBuffer(K::Storage, std::span<const uint32_t>(scene.packedNormals));
     indexBuffer_ = batch.createBuffer(K::GeometryInput, std::span<const uint32_t>(scene.indices));
     materialBuffer_ = batch.createBuffer(K::Storage, std::span<const GpuMaterial>(scene.materials));
     materialIdBuffer_ = batch.createBuffer(K::Storage, std::span<const uint32_t>(scene.materialIds));
@@ -178,8 +180,8 @@ void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
     vk::AccelerationStructureGeometryTrianglesDataKHR triangles;
     triangles.setVertexFormat(vk::Format::eR32G32B32Sfloat)
         .setVertexData(vertexBuffer_.address())
-        .setVertexStride(sizeof(GpuVertex))
-        .setMaxVertex(static_cast<uint32_t>(scene.vertices.size() - 1))
+        .setVertexStride(sizeof(glm::vec3))
+        .setMaxVertex(static_cast<uint32_t>(scene.positions.size() - 1))
         .setIndexType(vk::IndexType::eUint32)
         .setIndexData(indexBuffer_.address());
     const vk::AccelerationStructureGeometryKHR blasGeometry(vk::GeometryTypeKHR::eTriangles, triangles,
@@ -209,7 +211,7 @@ void Renderer::createSceneBuffers(UploadBatch& batch, const Scene& scene) {
 void Renderer::createTracePipeline() {
     if (useRayQuery_) {
         const auto comp = Stage::eCompute;
-        const std::array<vk::DescriptorSetLayoutBinding, 9> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 10> bindings{{
             {0, DT::eAccelerationStructureKHR, 1, comp},
             {1, DT::eStorageImage, 1, comp},
             {2, DT::eStorageBuffer, 1, comp},
@@ -219,6 +221,7 @@ void Renderer::createTracePipeline() {
             {6, DT::eStorageBuffer, 1, comp},
             {7, DT::eStorageImage, 1, comp},
             {8, DT::eStorageImage, 1, comp},
+            {9, DT::eStorageBuffer, 1, comp},
         }};
         rtSetLayout_ = ctx_.device.createDescriptorSetLayout({{}, bindings});
         const vk::PushConstantRange push(comp, 0, sizeof(FramePush));
@@ -238,16 +241,17 @@ void Renderer::createTracePipeline() {
     }
 
     const auto rgen = Stage::eRaygenKHR, chit = Stage::eClosestHitKHR;
-    const std::array<vk::DescriptorSetLayoutBinding, 9> bindings{{
+    const std::array<vk::DescriptorSetLayoutBinding, 10> bindings{{
         {0, DT::eAccelerationStructureKHR, 1, rgen},  // TLAS
         {1, DT::eStorageImage, 1, rgen},              // accumulated radiance + E[L^2]
-        {2, DT::eStorageBuffer, 1, rgen | chit},      // vertices
+        {2, DT::eStorageBuffer, 1, rgen | chit},      // vertex positions
         {3, DT::eStorageBuffer, 1, rgen | chit},      // indices
         {4, DT::eStorageBuffer, 1, rgen},             // materials
-        {5, DT::eStorageBuffer, 1, rgen | chit},      // per-triangle material ids
+        {5, DT::eStorageBuffer, 1, rgen | chit},      // per-triangle material ids (+ smooth bit)
         {6, DT::eStorageBuffer, 1, rgen},             // emissive triangles
         {7, DT::eStorageImage, 1, rgen},              // albedo guide
         {8, DT::eStorageImage, 1, rgen},              // normal + depth guide
+        {9, DT::eStorageBuffer, 1, rgen | chit},      // packed octahedral vertex normals
     }};
     rtSetLayout_ = ctx_.device.createDescriptorSetLayout({{}, bindings});
     const vk::PushConstantRange push(rgen, 0, sizeof(FramePush));
@@ -313,8 +317,10 @@ void Renderer::createPostPipelines() {
         const vk::PipelineShaderStageCreateInfo stage({}, Stage::eCompute, *mod, "main");
         return ctx_.device.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo({}, stage, *postLayout_));
     };
+    atrousPass0Pipeline_ = make("atrous_p0.comp");
     atrousPipeline_ = make("atrous.comp");
     tonemapPipeline_ = make("tonemap.comp");
+    tonemapFp16Pipeline_ = make("tonemap_fp16.comp");
 }
 
 void Renderer::createShaderBindingTable() {
@@ -349,7 +355,7 @@ void Renderer::createDescriptors() {
     const std::array<vk::DescriptorPoolSize, 3> sizes{{
         {DT::eAccelerationStructureKHR, 1},
         {DT::eStorageImage, 3},
-        {DT::eStorageBuffer, 5},
+        {DT::eStorageBuffer, 6},
     }};
     descriptorPool_ = ctx_.device.createDescriptorPool({vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, sizes});
     rtSet_ = std::move(ctx_.device.allocateDescriptorSets({*descriptorPool_, *rtSetLayout_}).front());
@@ -357,6 +363,7 @@ void Renderer::createDescriptors() {
     const auto tlasHandle = tlas_.handle();
     const vk::WriteDescriptorSetAccelerationStructureKHR tlasInfo(tlasHandle);
     const auto vInfo = vertexBuffer_.descriptor();
+    const auto nInfo = normalBuffer_.descriptor();
     const auto iInfo = indexBuffer_.descriptor();
     const auto mInfo = materialBuffer_.descriptor();
     const auto midInfo = materialIdBuffer_.descriptor();
@@ -365,7 +372,7 @@ void Renderer::createDescriptors() {
     const auto albedoInfo = albedo_.descriptor();
     const auto ndInfo = normalDepth_.descriptor();
 
-    const std::array<vk::WriteDescriptorSet, 9> writes{{
+    const std::array<vk::WriteDescriptorSet, 10> writes{{
         vk::WriteDescriptorSet(*rtSet_, 0, 0, 1, DT::eAccelerationStructureKHR).setPNext(&tlasInfo),
         vk::WriteDescriptorSet(*rtSet_, 1, 0, DT::eStorageImage, accumInfo),
         vk::WriteDescriptorSet(*rtSet_, 2, 0, DT::eStorageBuffer, {}, vInfo),
@@ -375,6 +382,7 @@ void Renderer::createDescriptors() {
         vk::WriteDescriptorSet(*rtSet_, 6, 0, DT::eStorageBuffer, {}, lInfo),
         vk::WriteDescriptorSet(*rtSet_, 7, 0, DT::eStorageImage, albedoInfo),
         vk::WriteDescriptorSet(*rtSet_, 8, 0, DT::eStorageImage, ndInfo),
+        vk::WriteDescriptorSet(*rtSet_, 9, 0, DT::eStorageBuffer, {}, nInfo),
     }};
     ctx_.device.updateDescriptorSets(writes, nullptr);
 }
@@ -487,7 +495,6 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
 
     const Image* tonemapSrc = &accum_;
     if (denoise_) {
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPipeline_);
         const std::array<std::pair<const Image*, const Image*>, kAtrousPasses> passes{{
             {&accum_, &pingA_},
             {&pingA_, &pingB_},
@@ -496,10 +503,15 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
             {&pingB_, &pingA_},
         }};
         static constexpr std::array<const char*, kAtrousPasses> kPassNames{
-            "Atrous Pass 0 (step 1)", "Atrous Pass 1 (step 2)", "Atrous Pass 2 (step 4)", "Atrous Pass 3 (step 8)",
+            "Atrous Pass 0 (step 1, smem)", "Atrous Pass 1 (step 2)", "Atrous Pass 2 (step 4)", "Atrous Pass 3 (step 8)",
             "Atrous Pass 4 (step 16)"};
         for (int pass = 0; pass < kAtrousPasses; pass++) {
             const ScopedGpuLabel label(ctx_, cmd, kPassNames[pass], {0.9f, 0.6f, 0.1f, 1.0f});
+            if (pass == 0) {
+                cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPass0Pipeline_);
+            } else if (pass == 1) {
+                cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *atrousPipeline_);
+            }
             post.stepWidth = 1 << pass;
             post.demodulate = pass == 0 ? 1 : 0;
             pushBindings(*passes[pass].first, *passes[pass].second);
@@ -513,7 +525,7 @@ void Renderer::recordPost(const vk::raii::CommandBuffer& cmd, bool writeTimestam
     {
         const ScopedGpuLabel label(ctx_, cmd, "Tonemap", {0.7f, 0.3f, 0.9f, 1.0f});
         post.demodulate = denoise_ ? 1 : 0;
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *tonemapPipeline_);
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, denoise_ ? *tonemapFp16Pipeline_ : *tonemapPipeline_);
         pushBindings(*tonemapSrc, pingB_);
         cmd.pushConstants<PostPush>(*postLayout_, Stage::eCompute, 0, post);
         cmd.dispatch(gx, gy, 1);
@@ -583,7 +595,7 @@ std::vector<uint8_t> Renderer::readLdr() const {
 
 std::vector<float> Renderer::readHdrRgb() const {
     const size_t pixelCount = size_t(extent_.width) * extent_.height;
-    const vk::DeviceSize hdrBytes = vk::DeviceSize(pixelCount) * 4 * sizeof(float);
+    const vk::DeviceSize hdrBytes = vk::DeviceSize(pixelCount) * 4 * (denoise_ ? sizeof(uint16_t) : sizeof(float));
     const Image& src = denoise_ ? pingA_ : accum_;
     Buffer hdrBuf(ctx_, Buffer::Kind::Readback, hdrBytes);
     Buffer albBuf;
@@ -596,7 +608,6 @@ std::vector<float> Renderer::readHdrRgb() const {
         if (denoise_) cmd.copyImageToBuffer(albedo_.handle(), vk::ImageLayout::eGeneral, albBuf.handle(), region);
     });
     hdrBuf.invalidate();
-    const auto* rgba = static_cast<const float*>(hdrBuf.mapped());
 
     auto f16ToF32 = [](uint16_t h) -> float {
         const uint32_t sign = (uint32_t(h & 0x8000u)) << 16;
@@ -623,11 +634,20 @@ std::vector<float> Renderer::readHdrRgb() const {
     if (denoise_) albBuf.invalidate();
 
     std::vector<float> rgb(pixelCount * 3);
-    for (size_t i = 0; i < pixelCount; i++) {
-        for (size_t c = 0; c < 3; c++) {
-            float v = rgba[4 * i + c] * exposure_;
-            if (alb) v *= std::max(f16ToF32(alb[4 * i + c]), 1e-3f);
-            rgb[3 * i + c] = std::max(v, 0.0f);
+    if (denoise_) {
+        const auto* rgba16 = static_cast<const uint16_t*>(hdrBuf.mapped());
+        for (size_t i = 0; i < pixelCount; i++) {
+            for (size_t c = 0; c < 3; c++) {
+                const float v = f16ToF32(rgba16[4 * i + c]) * exposure_ * std::max(f16ToF32(alb[4 * i + c]), 1e-3f);
+                rgb[3 * i + c] = std::max(v, 0.0f);
+            }
+        }
+    } else {
+        const auto* rgba32 = static_cast<const float*>(hdrBuf.mapped());
+        for (size_t i = 0; i < pixelCount; i++) {
+            for (size_t c = 0; c < 3; c++) {
+                rgb[3 * i + c] = std::max(rgba32[4 * i + c] * exposure_, 0.0f);
+            }
         }
     }
     return rgb;

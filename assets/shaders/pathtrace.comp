@@ -4,21 +4,24 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// Inline hardware ray-traced path tracer (VK_KHR_ray_query) in an 8x8 compute workgroup.
-// Uses the exact same RT cores as VK_KHR_ray_tracing_pipeline, without SBT dispatch,
-// continuation-state spilling, or hit-shader payload marshaling.
+// Inline hardware ray-traced path tracer (VK_KHR_ray_query) in an 8x8 compute workgroup:
+// - Flat path-regeneration loop eliminates idle warp lanes when paths terminate early.
+// - Compact 12-byte positions + 4-byte octahedral normals (skipped on flat triangles via bit 31).
+// - Roberts R6 low-discrepancy QMC with multi-triangle CDF light remapping for faster convergence.
+// - Hybrid unbiased Russian roulette: gentle sqrt(beta) at depth 2, linear beta at depth >= 3.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba32f) uniform image2D accumImage;
-layout(set = 0, binding = 2, scalar) readonly buffer Vertices { GpuVertex vertices[]; };
+layout(set = 0, binding = 2, scalar) readonly buffer Positions { vec3 positions[]; };
 layout(set = 0, binding = 3) readonly buffer Indices { uint indices[]; };
 layout(set = 0, binding = 4, scalar) readonly buffer Materials { GpuMaterial materials[]; };
 layout(set = 0, binding = 5) readonly buffer MaterialIds { uint materialIds[]; };
 layout(set = 0, binding = 6, scalar) readonly buffer Lights { GpuLight lights[]; };
 layout(set = 0, binding = 7, rgba16f) uniform image2D albedoImage;
-layout(set = 0, binding = 8, rgba32f) uniform image2D normalDepthImage;
+layout(set = 0, binding = 8, rgba16f) uniform image2D normalDepthImage;
+layout(set = 0, binding = 9) readonly buffer Normals { uint packedNormals[]; };
 
 layout(push_constant) uniform Frame {
     vec4 eye;              // xyz position, w = tan(fov / 2)
@@ -34,8 +37,6 @@ layout(push_constant) uniform Frame {
     uint seed;
     uint frameIndex;
 } pc;
-
-// ---- sampling helpers ----
 
 void basis(vec3 n, out vec3 t, out vec3 b) {
     const float s = n.z >= 0.0 ? 1.0 : -1.0;
@@ -79,35 +80,35 @@ float powerHeuristic(float a, float b) {
     return a2 / max(a2 + b * b, 1e-20);
 }
 
-float specularProbability(GpuMaterial m) {
-    const float d = luminance(m.diffuse.rgb), s = luminance(m.specular.rgb);
-    return d + s > 0.0 ? s / (d + s) : 0.0;
-}
-
 vec3 evalGlossyBsdf(GpuMaterial m, vec3 n, vec3 wo, vec3 wi, out float pdf) {
     const float cosI = dot(n, wi);
     if (cosI <= 0.0) {
         pdf = 0.0;
         return vec3(0.0);
     }
-    const float ps = specularProbability(m), e = m.specular.w;
+    const float ps = m.emission.w, e = m.specular.w;
     const float lobe = pow(max(0.0, dot(reflect(-wo, n), wi)), e);
-    pdf = (1.0 - ps) * (cosI / PI) + ps * (e + 1.0) / (2.0 * PI) * lobe;
-    return m.diffuse.rgb / PI + m.specular.rgb * (e + 2.0) / (2.0 * PI) * lobe;
+    pdf = (1.0 - ps) * (cosI * (1.0 / PI)) + ps * (e + 1.0) * (0.5 / PI) * lobe;
+    return m.diffuse.rgb * (1.0 / PI) + m.specular.rgb * (e + 2.0) * (0.5 / PI) * lobe;
 }
 
-bool sampleLight(vec3 p, float invLightArea, inout uint rng, out vec3 wi, out float dist, out vec3 radiance, out float pdf) {
+// Reuses u.x for both triangle selection (via CDF remap) and barycentric sampling to preserve QMC stratification.
+bool sampleLight(vec3 p, float invLightArea, vec2 u, out vec3 wi, out float dist, out vec3 radiance, out float pdf) {
     uint lo = 0u;
+    float u0 = u.x;
     if (pc.lightCount > 1u) {
-        const float x = rnd(rng) * pc.lightArea;
+        const float x = u.x * pc.lightArea;
         uint hi = pc.lightCount - 1u;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1u;
             if (lights[mid].v0Cdf.w < x) lo = mid + 1u; else hi = mid;
         }
+        const float cdfPrev = lo > 0u ? lights[lo - 1u].v0Cdf.w : 0.0;
+        const float triArea = max(lights[lo].v0Cdf.w - cdfPrev, 1e-20);
+        u0 = clamp((x - cdfPrev) / triArea, 0.0, 0.9999999);
     }
     const GpuLight lt = lights[lo];
-    const float su = sqrt(rnd(rng)), v = rnd(rng);
+    const float su = sqrt(u0), v = u.y;
     const vec3 q = lt.v0Cdf.xyz + (su * (1.0 - v)) * lt.e1.xyz + (su * v) * lt.e2.xyz;
 
     const vec3 d = q - p;
@@ -152,47 +153,57 @@ void main() {
     const vec3 camRightScaled = pc.eye.w * pc.right.w * pc.right.xyz;
     const vec3 camUpScaled = pc.eye.w * pc.up.xyz;
 
-    uint rng = pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(pc.frameIndex * 9781u + pc.seed)));
+    const uint pixSeed = pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(pc.seed)));
+    uint rng = pcgHash(pixSeed ^ pcgHash(pc.frameIndex * 9781u + 0x27d4eb2du));
 
     vec4 radianceSum = vec4(0.0);    // rgb = radiance sum, a = lum^2 sum
     vec4 albedoSum = vec4(0.0);      // a = fraction of paths whose guide surface is not a light
     vec4 normalDepthSum = vec4(0.0); // xyz = normal, w = depth
 
-    for (uint s = 0u; s < pc.spp; s++) {
-        const vec2 ndc = (vec2(pixel) + vec2(rnd(rng), rnd(rng))) * invSize * 2.0 - 1.0;
-        vec3 dir = normalize(pc.forward.xyz + ndc.x * camRightScaled - ndc.y * camUpScaled);
-        vec3 origin = pc.eye.xyz;
+    uint s = 0u;
+    uint depth = 0u;
+    vec3 origin = pc.eye.xyz;
+    vec3 dir;
+    {
+        const vec2 jit = qmcPair(pc.prevSamples, pixSeed, vec2(0.89865371, 0.80757850), 3u);
+        const vec2 ndc = (vec2(pixel) + jit) * invSize * 2.0 - 1.0;
+        dir = normalize(pc.forward.xyz + ndc.x * camRightScaled - ndc.y * camUpScaled);
+    }
 
-        vec3 L = vec3(0.0), beta = vec3(1.0);
-        float lastPdf = -1.0;     // < 0: delta/camera event
-        float pathLength = 0.0;   // < 0: guide already written
+    vec3 L = vec3(0.0), beta = vec3(1.0);
+    float lastPdf = -1.0;    // < 0: delta/camera event
+    float pathLength = 0.0;  // < 0: guide already written
 
-        for (uint depth = 0u; depth < pc.maxDepth; depth++) {
-            rayQueryEXT rq;
-            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.0, dir, 1e30);
-            while (rayQueryProceedEXT(rq)) {}
-            if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) break;
+    while (s < pc.spp) {
+        bool terminated = false;
 
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.0, dir, 1e30);
+        while (rayQueryProceedEXT(rq)) {}
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            terminated = true;
+        } else {
             const float hitT = rayQueryGetIntersectionTEXT(rq, true);
             if (pathLength >= 0.0) pathLength += hitT;
 
             const uint tri = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
             const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
             const vec3 b = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+            const uint matWord = materialIds[tri];
 
             const uint i0 = indices[3u * tri + 0u];
             const uint i1 = indices[3u * tri + 1u];
             const uint i2 = indices[3u * tri + 2u];
-            const vec3 p0 = vertices[i0].position.xyz;
-            const vec3 p1 = vertices[i1].position.xyz;
-            const vec3 p2 = vertices[i2].position.xyz;
+            const vec3 p0 = positions[i0], p1 = positions[i1], p2 = positions[i2];
             const vec3 hitPos = p0 * b.x + p1 * b.y + p2 * b.z;
-
             vec3 ng = normalize(cross(p1 - p0, p2 - p0));
             vec3 ns = ng;
-            const vec4 n0 = vertices[i0].normal;
-            if (n0.w > 0.0) {
-                const vec3 interp = n0.xyz * b.x + vertices[i1].normal.xyz * b.y + vertices[i2].normal.xyz * b.z;
+
+            if ((matWord & TRI_SMOOTH_NORMAL_BIT) != 0u) {
+                const vec3 interp = unpackOctNormal(packedNormals[i0]) * b.x +
+                                    unpackOctNormal(packedNormals[i1]) * b.y +
+                                    unpackOctNormal(packedNormals[i2]) * b.z;
                 if (dot(interp, interp) > 1e-12) ns = normalize(interp);
                 if (dot(ng, ns) < 0.0) ng = -ng;
             }
@@ -203,10 +214,9 @@ void main() {
                 ns = -ns;
             }
 
-            const GpuMaterial m = materials[materialIds[tri]];
+            const GpuMaterial m = materials[matWord & ~TRI_SMOOTH_NORMAL_BIT];
             const vec3 wo = -dir;
 
-            // Hit an emissive triangle: MIS-weigh against the light sample at the previous vertex.
             if (max(m.emission.r, max(m.emission.g, m.emission.b)) > 0.0) {
                 float w = 1.0;
                 if (lastPdf >= 0.0) {
@@ -216,102 +226,153 @@ void main() {
                 L += beta * m.emission.rgb * w;
                 if (pathLength >= 0.0) {
                     albedoSum += vec4(1.0, 1.0, 1.0, 0.0);
-                    normalDepthSum += vec4(ns, pathLength);
+                    normalDepthSum += vec4(ns, min(pathLength, 60000.0));
                     pathLength = -1.0;
                 }
-                break;
-            }
+                terminated = true;
+            } else {
+                const uint type = uint(m.diffuse.w);
+                if (pathLength >= 0.0 && type != MAT_MIRROR && type != MAT_DIELECTRIC) {
+                    const vec3 alb = min(m.diffuse.rgb + (type == MAT_GLOSSY ? m.specular.rgb : vec3(0.0)), vec3(1.0));
+                    albedoSum += vec4(alb, 1.0);
+                    normalDepthSum += vec4(ns, min(pathLength, 60000.0));
+                    pathLength = -1.0;
+                }
 
-            const uint type = uint(m.diffuse.w);
-            if (pathLength >= 0.0 && type != MAT_MIRROR && type != MAT_DIELECTRIC) {
-                const vec3 alb = min(m.diffuse.rgb + (type == MAT_GLOSSY ? m.specular.rgb : vec3(0.0)), vec3(1.0));
-                albedoSum += vec4(alb, 1.0);
-                normalDepthSum += vec4(ns, pathLength);
-                pathLength = -1.0;
-            }
+                const bool lastBounce = (depth + 1u >= pc.maxDepth);
+                vec3 offsetNormal = ng;
 
-            vec3 offsetNormal = ng;
-            if (type == MAT_DIFFUSE) {
-                // Next-event estimation (fast path for pure Lambertian diffuse)
-                vec3 wi, Le;
-                float dist, pdfLight;
-                if (pc.lightCount > 0u && sampleLight(hitPos, invLightArea, rng, wi, dist, Le, pdfLight) &&
-                    dot(wi, ng) > 0.0) {
-                    const float cosI = dot(ns, wi);
-                    if (cosI > 0.0 && visible(offsetRay(hitPos, ng), wi, dist)) {
-                        const float pdfBsdf = cosI * (1.0 / PI);
-                        L += beta * m.diffuse.rgb * Le * (pdfBsdf * powerHeuristic(pdfLight, pdfBsdf) / pdfLight);
+                if (type == MAT_DIFFUSE) {
+                    vec3 wi, Le;
+                    float dist, pdfLight;
+                    const vec2 uL = (depth == 0u) ? qmcPair(pc.prevSamples + s, pixSeed, vec2(0.72573342, 0.65218304), 13u)
+                                                  : vec2(rnd(rng), rnd(rng));
+                    if (pc.lightCount > 0u && sampleLight(hitPos, invLightArea, uL, wi, dist, Le, pdfLight) &&
+                        dot(wi, ng) > 0.0) {
+                        const float cosI = dot(ns, wi);
+                        if (cosI > 0.0 && visible(offsetRay(hitPos, ng), wi, dist)) {
+                            const float pdfBsdf = cosI * (1.0 / PI);
+                            L += beta * m.diffuse.rgb * Le * (pdfBsdf * powerHeuristic(pdfLight, pdfBsdf) / pdfLight);
+                        }
+                    }
+                    if (lastBounce) {
+                        terminated = true;
+                    } else {
+                        const vec2 uB = (depth == 0u) ? qmcPair(pc.prevSamples + s, pixSeed, vec2(0.58608670, 0.52668901), 23u)
+                                                      : vec2(rnd(rng), rnd(rng));
+                        dir = toWorld(sampleCosine(uB.x, uB.y), ns);
+                        const float cosDir = dot(ns, dir);
+                        if (cosDir <= 0.0 || dot(dir, ng) <= 0.0) {
+                            terminated = true;
+                        } else {
+                            beta *= m.diffuse.rgb;
+                            lastPdf = cosDir * (1.0 / PI);
+                        }
+                    }
+                } else if (type == MAT_GLOSSY) {
+                    vec3 wi, Le;
+                    float dist, pdfLight;
+                    const vec2 uL = (depth == 0u) ? qmcPair(pc.prevSamples + s, pixSeed, vec2(0.72573342, 0.65218304), 13u)
+                                                  : vec2(rnd(rng), rnd(rng));
+                    if (pc.lightCount > 0u && sampleLight(hitPos, invLightArea, uL, wi, dist, Le, pdfLight) &&
+                        dot(wi, ng) > 0.0) {
+                        float pdfBsdf;
+                        const vec3 f = evalGlossyBsdf(m, ns, wo, wi, pdfBsdf);
+                        if (pdfBsdf > 0.0 && visible(offsetRay(hitPos, ng), wi, dist)) {
+                            L += beta * f * Le * dot(ns, wi) * powerHeuristic(pdfLight, pdfBsdf) / pdfLight;
+                        }
+                    }
+                    if (lastBounce) {
+                        terminated = true;
+                    } else {
+                        const vec2 uB = (depth == 0u) ? qmcPair(pc.prevSamples + s, pixSeed, vec2(0.58608670, 0.52668901), 23u)
+                                                      : vec2(rnd(rng), rnd(rng));
+                        if (rnd(rng) < m.emission.w) {
+                            dir = toWorld(samplePhongLobe(uB.x, uB.y, m.specular.w), reflect(-wo, ns));
+                        } else {
+                            dir = toWorld(sampleCosine(uB.x, uB.y), ns);
+                        }
+                        float pdf;
+                        const vec3 f = evalGlossyBsdf(m, ns, wo, dir, pdf);
+                        if (pdf <= 0.0 || dot(dir, ng) <= 0.0) {
+                            terminated = true;
+                        } else {
+                            beta *= f * dot(ns, dir) / pdf;
+                            lastPdf = pdf;
+                        }
+                    }
+                } else if (type == MAT_MIRROR) {
+                    if (lastBounce) {
+                        terminated = true;
+                    } else {
+                        dir = reflect(-wo, ns);
+                        beta *= m.specular.rgb;
+                        lastPdf = -1.0;
+                    }
+                } else {
+                    if (lastBounce) {
+                        terminated = true;
+                    } else {
+                        const float ior = m.emission.w;
+                        const float etaI = frontFace ? 1.0 : ior;
+                        const float etaT = frontFace ? ior : 1.0;
+                        const float cosI = clamp(dot(wo, ns), 0.0, 1.0);
+                        float cosT;
+                        if (rnd(rng) < fresnel(cosI, etaI, etaT, cosT)) {
+                            dir = reflect(-wo, ns);
+                        } else {
+                            const float eta = etaI / etaT;
+                            dir = normalize(eta * -wo + (eta * cosI - cosT) * ns);
+                            offsetNormal = -ng;
+                        }
+                        lastPdf = -1.0;
                     }
                 }
-                // Cosine-weighted Lambertian continuation: f * cosI / pdf == kd identically.
-                dir = toWorld(sampleCosine(rnd(rng), rnd(rng)), ns);
-                const float cosDir = dot(ns, dir);
-                if (cosDir <= 0.0 || dot(dir, ng) <= 0.0) break;
-                beta *= m.diffuse.rgb;
-                lastPdf = cosDir * (1.0 / PI);
-            } else if (type == MAT_GLOSSY) {
-                vec3 wi, Le;
-                float dist, pdfLight;
-                if (pc.lightCount > 0u && sampleLight(hitPos, invLightArea, rng, wi, dist, Le, pdfLight) &&
-                    dot(wi, ng) > 0.0) {
-                    float pdfBsdf;
-                    const vec3 f = evalGlossyBsdf(m, ns, wo, wi, pdfBsdf);
-                    if (pdfBsdf > 0.0 && visible(offsetRay(hitPos, ng), wi, dist)) {
-                        L += beta * f * Le * dot(ns, wi) * powerHeuristic(pdfLight, pdfBsdf) / pdfLight;
+
+                // Hybrid unbiased Russian roulette: gentle sqrt(beta) at depth 2 keeps 3rd-bounce GI clean,
+                // linear beta at depth >= 3 prunes deep tail bounces aggressively.
+                if (!terminated && depth >= 2u) {
+                    const float maxB = max(beta.r, max(beta.g, beta.b));
+                    const float q = (depth == 2u) ? clamp(sqrt(maxB), 0.10, 0.95) : clamp(maxB, 0.05, 0.95);
+                    if (rnd(rng) > q) {
+                        terminated = true;
+                    } else {
+                        beta /= q;
                     }
                 }
-                const float ps = specularProbability(m);
-                if (rnd(rng) < ps) {
-                    dir = toWorld(samplePhongLobe(rnd(rng), rnd(rng), m.specular.w), reflect(-wo, ns));
-                } else {
-                    dir = toWorld(sampleCosine(rnd(rng), rnd(rng)), ns);
+                if (!terminated) {
+                    origin = offsetRay(hitPos, offsetNormal);
+                    depth++;
                 }
-                float pdf;
-                const vec3 f = evalGlossyBsdf(m, ns, wo, dir, pdf);
-                if (pdf <= 0.0 || dot(dir, ng) <= 0.0) break;
-                beta *= f * dot(ns, dir) / pdf;
-                lastPdf = pdf;
-            } else if (type == MAT_MIRROR) {
-                dir = reflect(-wo, ns);
-                beta *= m.specular.rgb;
-                lastPdf = -1.0;
-            } else {  // dielectric
-                const float ior = m.emission.w;
-                const float etaI = frontFace ? 1.0 : ior;
-                const float etaT = frontFace ? ior : 1.0;
-                const float cosI = clamp(dot(wo, ns), 0.0, 1.0);
-                float cosT;
-                if (rnd(rng) < fresnel(cosI, etaI, etaT, cosT)) {
-                    dir = reflect(-wo, ns);
-                } else {
-                    const float eta = etaI / etaT;
-                    dir = normalize(eta * -wo + (eta * cosI - cosT) * ns);
-                    offsetNormal = -ng;
-                }
-                lastPdf = -1.0;
-            }
-            origin = offsetRay(hitPos, offsetNormal);
-
-            if (depth >= 3u) {
-                const float q = clamp(max(beta.r, max(beta.g, beta.b)), 0.05, 0.95);
-                if (rnd(rng) > q) break;
-                beta /= q;
             }
         }
 
-        if (pathLength >= 0.0) {
-            albedoSum += vec4(1.0);
-            normalDepthSum += vec4(0.0, 0.0, 0.0, 1e4);
-        }
+        if (terminated) {
+            if (pathLength >= 0.0) {
+                albedoSum += vec4(1.0);
+                normalDepthSum += vec4(0.0, 0.0, 0.0, 1e4);
+            }
+            if (any(isnan(L)) || any(isinf(L))) L = vec3(0.0);
+            float lum = luminance(L);
+            if (pc.clampLuminance > 0.0 && lum > pc.clampLuminance) {
+                L *= pc.clampLuminance / lum;
+                lum = pc.clampLuminance;
+            }
+            radianceSum += vec4(L, lum * lum);
 
-        if (any(isnan(L)) || any(isinf(L))) L = vec3(0.0);
-        float lum = luminance(L);
-        if (pc.clampLuminance > 0.0 && lum > pc.clampLuminance) {
-            L *= pc.clampLuminance / lum;
-            lum = pc.clampLuminance;
+            s++;
+            if (s < pc.spp) {
+                const vec2 jit = qmcPair(pc.prevSamples + s, pixSeed, vec2(0.89865371, 0.80757850), 3u);
+                const vec2 ndc = (vec2(pixel) + jit) * invSize * 2.0 - 1.0;
+                dir = normalize(pc.forward.xyz + ndc.x * camRightScaled - ndc.y * camUpScaled);
+                origin = pc.eye.xyz;
+                L = vec3(0.0);
+                beta = vec3(1.0);
+                lastPdf = -1.0;
+                pathLength = 0.0;
+                depth = 0u;
+            }
         }
-
-        radianceSum += vec4(L, lum * lum);
     }
 
     const float inv = 1.0 / float(pc.spp);
@@ -320,8 +381,9 @@ void main() {
     vec4 normalDepth = normalDepthSum * inv;
 
     if (pc.prevSamples == 0u) {
-        // Pack light-mask sign bit into normalDepth.w so atrous passes 1..4 skip albedoImage completely.
-        if (albedo.a < 0.5) normalDepth.w = -abs(normalDepth.w);
+        if (dot(normalDepth.xyz, normalDepth.xyz) > 1e-8) normalDepth.xyz = normalize(normalDepth.xyz);
+        normalDepth.w = min(abs(normalDepth.w), 60000.0);
+        if (albedo.a < 0.5) normalDepth.w = -normalDepth.w;
         imageStore(accumImage, pixel, radiance);
         imageStore(albedoImage, pixel, albedo);
         imageStore(normalDepthImage, pixel, normalDepth);
@@ -332,7 +394,9 @@ void main() {
         vec4 prevNd = imageLoad(normalDepthImage, pixel);
         prevNd.w = abs(prevNd.w);
         vec4 newNd = mix(prevNd, normalDepth, w);
-        if (newAlb.a < 0.5) newNd.w = -abs(newNd.w);
+        if (dot(newNd.xyz, newNd.xyz) > 1e-8) newNd.xyz = normalize(newNd.xyz);
+        newNd.w = min(abs(newNd.w), 60000.0);
+        if (newAlb.a < 0.5) newNd.w = -newNd.w;
 
         imageStore(accumImage, pixel, mix(imageLoad(accumImage, pixel), radiance, w));
         imageStore(albedoImage, pixel, newAlb);

@@ -389,7 +389,7 @@ int main(int argc, char** argv) {
                      renderer.usingRayQuery() ? "ray_query" : "rt_pipeline",
                      ctx.hasMaintenance5 ? ", maintenance5" : "", ctx.validationEnabled ? ", validation" : "");
         std::println("  {} triangles ({} unique vertices), {} emissive, loaded + BVH built in {:.0f} ms on {}",
-                     scene.triangleCount(), scene.vertices.size(), scene.lights.size(),
+                     scene.triangleCount(), scene.positions.size(), scene.lights.size(),
                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), ctx.deviceName);
 
         const glm::vec3 size = scene.boundsMax - scene.boundsMin;

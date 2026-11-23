@@ -3,9 +3,11 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
 
+#include <glm/gtc/packing.hpp>
 #include <glm/gtx/hash.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <print>
@@ -17,12 +19,35 @@ namespace {
 
 glm::vec3 rgb(const tinyobj::real_t* c) noexcept { return {c[0], c[1], c[2]}; }
 float maxComponent(glm::vec3 v) noexcept { return std::max({v.x, v.y, v.z}); }
+float luminance(glm::vec3 c) noexcept { return glm::dot(c, glm::vec3(0.2126f, 0.7152f, 0.0722f)); }
+
+uint32_t packOctNormal(glm::vec3 n) noexcept {
+    const float len = glm::length(n);
+    if (len <= 1e-12f) return 0u;
+    n /= len;
+    const float invL1 = 1.0f / (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
+    glm::vec2 p(n.x * invL1, n.y * invL1);
+    if (n.z < 0.0f) {
+        const float sx = p.x >= 0.0f ? 1.0f : -1.0f;
+        const float sy = p.y >= 0.0f ? 1.0f : -1.0f;
+        p = glm::vec2((1.0f - std::abs(p.y)) * sx, (1.0f - std::abs(p.x)) * sy);
+    }
+    return glm::packSnorm2x16(glm::clamp(p, glm::vec2(-1.0f), glm::vec2(1.0f)));
+}
+
+struct VertexKey {
+    glm::vec3 position;
+    uint32_t packedNormal;
+    uint8_t hasNormal;
+    bool operator==(const VertexKey&) const = default;
+};
 
 struct VertexHash {
-    size_t operator()(const GpuVertex& v) const noexcept {
-        const size_t h1 = std::hash<glm::vec4>{}(v.position);
-        const size_t h2 = std::hash<glm::vec4>{}(v.normal);
-        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    size_t operator()(const VertexKey& v) const noexcept {
+        size_t h = std::hash<glm::vec3>{}(v.position);
+        h ^= std::hash<uint32_t>{}(v.packedNormal) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<uint8_t>{}(v.hasNormal) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
     }
 };
 
@@ -31,7 +56,7 @@ struct VertexHash {
 GpuMaterial convert(const tinyobj::material_t& m) {
     glm::vec3 kd = rgb(m.diffuse), ks = rgb(m.specular), ke = rgb(m.emission);
     const float ns = std::max(1.0f, static_cast<float>(m.shininess));
-    const float ior = m.ior > 1.0f ? static_cast<float>(m.ior) : 1.5f;
+    float extra = m.ior > 1.0f ? static_cast<float>(m.ior) : 1.5f;
 
     MaterialType type = MaterialType::Diffuse;
     if (m.illum == 5) {
@@ -43,15 +68,17 @@ GpuMaterial convert(const tinyobj::material_t& m) {
         type = ns >= 2000.0f ? MaterialType::Mirror : MaterialType::Glossy;
     }
 
-    // Keep glossy surfaces energy-conserving: diffuse + specular cannot reflect more than came in.
+    // Keep glossy surfaces energy-conserving and precompute specular sampling probability in emission.w.
     if (type == MaterialType::Glossy) {
         const float total = maxComponent(kd + ks);
         if (total > 0.99f) {
             kd *= 0.99f / total;
             ks *= 0.99f / total;
         }
+        const float d = luminance(kd), s = luminance(ks);
+        extra = (d + s > 0.0f) ? (s / (d + s)) : 0.0f;
     }
-    return {glm::vec4(kd, static_cast<float>(std::to_underlying(type))), glm::vec4(ks, ns), glm::vec4(ke, ior)};
+    return {glm::vec4(kd, static_cast<float>(std::to_underlying(type))), glm::vec4(ks, ns), glm::vec4(ke, extra)};
 }
 
 }  // namespace
@@ -81,41 +108,53 @@ Scene loadObj(const std::string& path) {
     scene.boundsMin = glm::vec3(std::numeric_limits<float>::max());
     scene.boundsMax = glm::vec3(std::numeric_limits<float>::lowest());
 
-    std::unordered_map<GpuVertex, uint32_t, VertexHash> uniqueVertices;
+    std::unordered_map<VertexKey, uint32_t, VertexHash> uniqueVertices;
     for (const auto& shape : shapes) {
         const auto& mesh = shape.mesh;
         for (size_t f = 0; f < mesh.num_face_vertices.size(); f++) {
+            bool faceHasNormals = true;
             for (int k = 0; k < 3; k++) {
                 const tinyobj::index_t idx = mesh.indices[3 * f + k];
-                GpuVertex v{};
-                v.position = glm::vec4(attrib.vertices[3 * idx.vertex_index + 0], attrib.vertices[3 * idx.vertex_index + 1],
-                                       attrib.vertices[3 * idx.vertex_index + 2], 1.0f);
+                const glm::vec3 pos(attrib.vertices[3 * idx.vertex_index + 0], attrib.vertices[3 * idx.vertex_index + 1],
+                                    attrib.vertices[3 * idx.vertex_index + 2]);
+                uint32_t packedN = 0u;
+                uint8_t hasN = 0u;
                 if (idx.normal_index >= 0) {
-                    v.normal = glm::vec4(attrib.normals[3 * idx.normal_index + 0], attrib.normals[3 * idx.normal_index + 1],
-                                         attrib.normals[3 * idx.normal_index + 2], 1.0f);
+                    const glm::vec3 n(attrib.normals[3 * idx.normal_index + 0], attrib.normals[3 * idx.normal_index + 1],
+                                      attrib.normals[3 * idx.normal_index + 2]);
+                    if (glm::dot(n, n) > 1e-12f) {
+                        packedN = packOctNormal(n);
+                        hasN = 1u;
+                    }
                 }
-                const auto [it, inserted] = uniqueVertices.emplace(v, static_cast<uint32_t>(scene.vertices.size()));
+                if (!hasN) faceHasNormals = false;
+                const VertexKey key{pos, packedN, hasN};
+                const auto [it, inserted] = uniqueVertices.emplace(key, static_cast<uint32_t>(scene.positions.size()));
                 if (inserted) {
-                    scene.boundsMin = glm::min(scene.boundsMin, glm::vec3(v.position));
-                    scene.boundsMax = glm::max(scene.boundsMax, glm::vec3(v.position));
-                    scene.vertices.push_back(v);
+                    scene.boundsMin = glm::min(scene.boundsMin, pos);
+                    scene.boundsMax = glm::max(scene.boundsMax, pos);
+                    scene.positions.push_back(pos);
+                    scene.packedNormals.push_back(packedN);
                 }
                 scene.indices.push_back(it->second);
             }
             const int mat = f < mesh.material_ids.size() ? mesh.material_ids[f] : -1;
-            scene.materialIds.push_back(mat >= 0 && mat < static_cast<int>(materials.size()) ? static_cast<uint32_t>(mat)
-                                                                                             : fallback);
+            uint32_t matId =
+                mat >= 0 && mat < static_cast<int>(materials.size()) ? static_cast<uint32_t>(mat) : fallback;
+            if (faceHasNormals) matId |= kTriSmoothNormalBit;
+            scene.materialIds.push_back(matId);
         }
     }
     if (scene.indices.empty()) throw std::runtime_error(path + " has no triangles");
 
     // Every emissive triangle is pre-unpacked into a self-contained GpuLight record (no GPU pointer chasing).
     for (uint32_t t = 0; t < scene.triangleCount(); t++) {
-        const glm::vec3 em(scene.materials[scene.materialIds[t]].emission);
+        const uint32_t matIdx = scene.materialIds[t] & ~kTriSmoothNormalBit;
+        const glm::vec3 em(scene.materials[matIdx].emission);
         if (maxComponent(em) <= 0.0f) continue;
-        const glm::vec3 a(scene.vertices[scene.indices[3 * t + 0]].position);
-        const glm::vec3 b(scene.vertices[scene.indices[3 * t + 1]].position);
-        const glm::vec3 c(scene.vertices[scene.indices[3 * t + 2]].position);
+        const glm::vec3 a = scene.positions[scene.indices[3 * t + 0]];
+        const glm::vec3 b = scene.positions[scene.indices[3 * t + 1]];
+        const glm::vec3 c = scene.positions[scene.indices[3 * t + 2]];
         const glm::vec3 e1 = b - a;
         const glm::vec3 e2 = c - a;
         const glm::vec3 crossVec = glm::cross(e1, e2);

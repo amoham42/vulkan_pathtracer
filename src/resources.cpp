@@ -259,9 +259,11 @@ Image UploadBatch::createImage(vk::Extent2D extent, vk::Format format, vk::Image
 
 Accel UploadBatch::buildAccel(const vk::AccelerationStructureGeometryKHR& geometry, uint32_t primitiveCount,
                               vk::AccelerationStructureTypeKHR type) {
+    const vk::BuildAccelerationStructureFlagsKHR flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+
     vk::AccelerationStructureBuildGeometryInfoKHR build;
     build.setType(type)
-        .setFlags(vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace)
+        .setFlags(flags)
         .setMode(vk::BuildAccelerationStructureModeKHR::eBuild)
         .setGeometries(geometry);
 

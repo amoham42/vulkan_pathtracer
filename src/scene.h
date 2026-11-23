@@ -9,21 +9,15 @@
 
 // Layouts shared with assets/shaders/common.glsl (scalar block layout). Verified at compile time below.
 
-struct GpuVertex {
-    glm::vec4 position;  // xyz
-    glm::vec4 normal;    // xyz, w = 1 if the OBJ supplied a normal (else the shader uses the face normal)
-
-    bool operator==(const GpuVertex&) const = default;
-};
-static_assert(sizeof(GpuVertex) == 32);
-static_assert(offsetof(GpuVertex, normal) == 16);
+// Bit 31 of materialIds[tri] indicates the triangle has authored smooth vertex normals.
+inline constexpr uint32_t kTriSmoothNormalBit = 0x80000000u;
 
 enum class MaterialType : uint32_t { Diffuse = 0, Glossy = 1, Mirror = 2, Dielectric = 3 };
 
 struct GpuMaterial {
     glm::vec4 diffuse;   // rgb albedo, w = MaterialType
     glm::vec4 specular;  // rgb, w = Phong exponent
-    glm::vec4 emission;  // rgb radiance, w = index of refraction
+    glm::vec4 emission;  // rgb radiance, w = ior (Dielectric) or specularProbability (Glossy)
 };
 static_assert(sizeof(GpuMaterial) == 48);
 static_assert(offsetof(GpuMaterial, specular) == 16);
@@ -44,10 +38,13 @@ static_assert(offsetof(GpuLight, normalPad) == 48);
 static_assert(offsetof(GpuLight, emission) == 64);
 
 /// A deduplicated triangle mesh loaded from Wavefront OBJ + MTL, ready for GPU upload.
+/// Positions (12 B) and octahedral snorm16x2 normals (4 B) are stored in compact parallel arrays;
+/// flat triangles carry bit 31 clear in materialIds so position_fetch hits skip index/normal loads entirely.
 struct Scene {
-    std::vector<GpuVertex> vertices;
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> packedNormals;  // octahedral snorm16x2 per vertex
     std::vector<uint32_t> indices;
-    std::vector<uint32_t> materialIds;  // one per triangle
+    std::vector<uint32_t> materialIds;    // bits 0..30 = material index, bit 31 = has smooth vertex normals
     std::vector<GpuMaterial> materials;
     std::vector<GpuLight> lights;
     float lightArea = 0.0f;
